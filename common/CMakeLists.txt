@@ -97,6 +97,8 @@ add_library(${TARGET}
     ngram-map.h
     ngram-mod.cpp
     ngram-mod.h
+    ngram-suffix.cpp
+    ngram-suffix.h
     peg-parser.cpp
     peg-parser.h
     preset.cpp

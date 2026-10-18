@@ -8,6 +8,7 @@
 #include "json.h"
 #include "llama.h"
 #include "log.h"
+#include "ngram-suffix.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "preset.h"
@@ -4329,6 +4330,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
             }
             params.speculative.ngram_mod.n_match = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-n-match"}, "N",
+        string_format("ngram-suffix lookup length k: the last k tokens are matched against earlier positions of the request (default: %d)", params.speculative.ngram_suffix.n_match),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram-suffix n-match must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_suffix.n_match = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-n-min"}, "N",
+        string_format("ngram-suffix minimum draft length (policy match/adapt) (default: %d)", params.speculative.ngram_suffix.n_min),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("ngram-suffix n-min must be between 0 and 1024 inclusive");
+            }
+            params.speculative.ngram_suffix.n_min = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-n-max"}, "N",
+        string_format("ngram-suffix maximum draft length (default: %d)", params.speculative.ngram_suffix.n_max),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram-suffix n-max must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_suffix.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-policy"}, "{match,fixed,adapt}",
+        string_format("ngram-suffix draft length policy: match = max(n-min, length of the backward match, capped at n-max), "
+            "fixed = n-max, adapt = start at n-min, double after a fully accepted draft, else accepted+1 (default: %s)",
+            params.speculative.ngram_suffix.policy.c_str()),
+        [](common_params & params, const std::string & value) {
+            common_ngram_suffix_policy policy;
+            if (!common_ngram_suffix_policy_from_str(value.c_str(), policy)) {
+                throw std::invalid_argument("ngram-suffix policy must be one of: match, fixed, adapt");
+            }
+            params.speculative.ngram_suffix.policy = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 

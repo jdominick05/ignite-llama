@@ -8,6 +8,7 @@
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
+#include "ngram-suffix.h"
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
@@ -80,7 +81,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"ngram-suffix",  COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -2147,6 +2149,110 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     }
 };
 
+// state of self-speculation from the latest earlier occurrence of the last k tokens in the same request
+// (see ngram-suffix.h), one index per sequence
+struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
+    common_params_speculative_ngram_suffix params;
+
+    struct seq_info {
+        common_ngram_suffix sfx;
+
+        // length of the last draft returned by this implementation (0 = none)
+        size_t n_draft_last = 0;
+    };
+
+    std::vector<seq_info> sinfos;
+
+    static common_ngram_suffix_policy parse_policy(const std::string & str) {
+        common_ngram_suffix_policy policy = COMMON_NGRAM_SUFFIX_POLICY_MATCH;
+        if (!common_ngram_suffix_policy_from_str(str.c_str(), policy)) {
+            SPC_WRN("unknown ngram-suffix policy '%s' - using 'match'\n", str.c_str());
+        }
+        return policy;
+    }
+
+    common_speculative_impl_ngram_suffix(
+            const common_params_speculative & params,
+            uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX, n_seq, params.ngram_suffix.n_max)
+        , params(params.ngram_suffix) {
+        static_assert(sizeof(llama_token) == sizeof(common_ngram_suffix::token_t));
+
+        const auto policy = parse_policy(this->params.policy);
+
+        SPC_TRC("%s", "adding speculative implementation 'ngram-suffix'\n");
+        SPC_TRC("- n_match=%d, n_min=%d, n_max=%d, policy=%s\n",
+                this->params.n_match, this->params.n_min, this->params.n_max, common_ngram_suffix_policy_to_str(policy));
+
+        sinfos.reserve(n_seq);
+        for (uint32_t i = 0; i < n_seq; ++i) {
+            sinfos.push_back({
+                common_ngram_suffix(
+                    (uint16_t) std::max(1, this->params.n_match),
+                    (uint16_t) std::max(0, this->params.n_min),
+                    (uint16_t) std::max(0, this->params.n_max),
+                    policy),
+                0,
+            });
+        }
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        GGML_ASSERT(seq_id < (llama_seq_id) n_seq);
+
+        auto & sinfo = sinfos[seq_id];
+
+        sinfo.sfx.begin(prompt.data(), prompt.size());
+        sinfo.n_draft_last = 0;
+    }
+
+    bool process(const common_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        assert(dparams.size() == n_seq);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            auto & sinfo  = sinfos[seq_id];
+            auto & result = *dp.result;
+
+            const auto & prompt = *dp.prompt;
+
+            sinfo.sfx.draft(prompt.data(), prompt.size(), dp.id_last, result);
+
+            // never exceed the declared n_max (n_min > n_max would allow it), which sizes the server's output limits
+            if ((int) result.size() > n_max) {
+                result.resize(std::max(0, n_max));
+            }
+
+            // apply the per-call limit here so that n_draft_last is the length the target verifies
+            if (dp.n_max > 0 && (int) result.size() > dp.n_max) {
+                result.resize(dp.n_max);
+            }
+
+            sinfo.n_draft_last = result.size();
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        GGML_ASSERT(seq_id < (llama_seq_id) n_seq);
+
+        auto & sinfo = sinfos[seq_id];
+
+        if (!is_other) {
+            sinfo.sfx.accept(n_accepted, sinfo.n_draft_last);
+        }
+
+        sinfo.n_draft_last = 0;
+    }
+};
+
 struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     common_params_speculative_ngram_cache params;
 
@@ -2362,6 +2468,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX:  return "ngram-suffix";
         default:                                    return "unknown";
     }
 }
@@ -2464,6 +2571,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX:
+                n_max = std::max(n_max, std::max(0, spec->ngram_suffix.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -2742,7 +2852,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2750,6 +2860,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
@@ -2819,6 +2930,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             case COMMON_SPECULATIVE_TYPE_NGRAM_MOD: {
                 impls.push_back(
                         std::make_unique<common_speculative_impl_ngram_mod>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX: {
+                impls.push_back(
+                        std::make_unique<common_speculative_impl_ngram_suffix>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {

@@ -183,6 +183,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX,  // self-speculative decoding from the latest earlier occurrence of the last k tokens
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -363,6 +364,14 @@ struct common_params_speculative_ngram_mod {
     int32_t n_min = 48;
 };
 
+struct common_params_speculative_ngram_suffix {
+    int32_t n_match = 3;  // k: length of the lookup k-gram (ends with the last sampled token)
+    int32_t n_min   = 1;  // minimum draft length (policy match/adapt)
+    int32_t n_max   = 32; // maximum draft length
+
+    std::string policy = "match"; // match: max(n_min, backward match length), fixed: n_max, adapt: grow/shrink
+};
+
 struct common_params_speculative_ngram_map {
     uint16_t size_n   = 12; // ngram size for lookup
     uint16_t size_m   = 48; // mgram size for speculative tokens
@@ -389,6 +398,8 @@ struct common_params_speculative {
     common_params_speculative_ngram_map ngram_map_k4v;
 
     common_params_speculative_ngram_cache ngram_cache;
+
+    common_params_speculative_ngram_suffix ngram_suffix;
 
     bool has_dft() const {
         return !draft.mparams.empty();
