@@ -3796,6 +3796,31 @@ private:
                                 n_past = 0;
                             }
 
+                            // llm-work: where the new prompt leaves the cached one, counted in chat messages (<|im_start|>),
+                            // plus the checkpoint positions, so full re-reads can be traced to their cause. Positions only.
+                            if (!slot.task->is_stateless()) {
+                                static const llama_token tok_msg = [&] {
+                                    const auto t = common_tokenize(ctx_tgt, "<|im_start|>", false, true);
+                                    return t.size() == 1 ? t[0] : LLAMA_TOKEN_NULL;
+                                }();
+                                int msg_div = 0;
+                                int msg_new = 0;
+                                for (size_t i = 0; tok_msg != LLAMA_TOKEN_NULL && i < input_tokens.size(); i++) {
+                                    if (input_tokens[i] == tok_msg) {
+                                        msg_new++;
+                                        if ((int) i < n_past) {
+                                            msg_div++;
+                                        }
+                                    }
+                                }
+                                std::string cps;
+                                for (const auto & cp : slot.prompt.checkpoints) {
+                                    cps += (cps.empty() ? "" : " ") + std::to_string(cp.n_tokens);
+                                }
+                                SLT_INF(slot, "prompt cache: cached = %d, prompt = %d, common prefix = %d, diverges in message %d of %d, checkpoints at [%s]\n",
+                                        (int) slot.prompt.tokens.size(), (int) input_tokens.size(), n_past, msg_div, msg_new, cps.c_str());
+                            }
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -3899,7 +3924,8 @@ private:
                                     }
 
                                     if (do_reset) {
-                                        SLT_INF(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
+                                        SLT_INF(slot, "forcing full prompt re-processing due to lack of cache data (n_past = %d, pos_next = %d, memory pos_min = %d, needed a checkpoint with pos_min < %d and pos_max <= %d; see %s)\n",
+                                                n_past, pos_next, pos_min, pos_min_thold, pos_next,
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
