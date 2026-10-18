@@ -2565,12 +2565,29 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // llm-work patch: keep the earliest checkpoint (end of the system prompt / first user message) and the
+            // newest, and drop the one whose removal leaves the smallest gap, so the remaining checkpoints stay spread
+            // over the whole prompt. Dropping the oldest instead leaves nothing to restore when an agent edits the
+            // prompt far back (reasoning stripped at a new user turn, cleared tool output, compaction), and a
+            // hybrid/recurrent model then re-processes the full prompt.
+            auto victim = slot.prompt.checkpoints.begin();
+            if (slot.prompt.checkpoints.size() >= 3) {
+                int64_t best_gap = INT64_MAX;
+                auto prev = slot.prompt.checkpoints.begin();
+                for (auto it = std::next(prev); std::next(it) != slot.prompt.checkpoints.end(); prev = it, ++it) {
+                    const int64_t gap = std::next(it)->n_tokens - prev->n_tokens;
+                    if (gap < best_gap) {
+                        best_gap = gap;
+                        victim   = it;
+                    }
+                }
+            }
+            const auto & cur = *victim;
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+            SLT_WRN(slot, "erasing context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(victim);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -3878,11 +3895,11 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        SLT_INF(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
                                     if (do_reset) {
-                                        SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
+                                        SLT_INF(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
