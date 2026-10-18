@@ -5,6 +5,9 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <algorithm>
+#include <cstdlib>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
@@ -710,7 +713,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            // Max Q columns for the vector kernel with a quantized cache. GGML_CUDA_FATTN_VEC_MAX_COLS=1 sends 2-column
+            // batches (verifying 1 drafted token) to the tile kernel instead; the 2-column vector kernel is slow at long
+            // context for head size 256 on RDNA3.
+            static const int vec_max_cols_env = [] {
+                const char * env = getenv("GGML_CUDA_FATTN_VEC_MAX_COLS");
+                return env ? std::max(1, std::min(atoi(env), 2)) : 0;
+            }();
+            // RX 7900 XTX, head size 256, q4_0 cache: 2 columns via tile instead of vec = -14% at 4k, -44% at 64k
+            const int vec_max_cols = vec_max_cols_env ? vec_max_cols_env : (GGML_CUDA_CC_IS_RDNA3(cc) && Q->ne[0] >= 256 ? 1 : 2);
+            if (Q->ne[1] <= vec_max_cols) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
