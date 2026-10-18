@@ -3,7 +3,9 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -318,6 +320,18 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
+    }
+    // Tuning override for the dense MMVQ -> MMQ switch: GGML_CUDA_MMVQ_MAX_BATCH=N uses MMVQ for batch sizes <= N.
+    static const int env_max_batch = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_MAX_BATCH");
+        return env ? std::min(atoi(env), MMVQ_MAX_BATCH_SIZE) : -1;
+    }();
+    if (env_max_batch >= 0) {
+        return ne11 <= env_max_batch;
+    }
+    if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+        // tuned on RX 7900 XTX (dense 27B, IQ4_XS/Q5_K/Q6_K/Q8_0 mix): MMQ wins from batch 6 (batch 8: -13..22%)
+        return ne11 <= 5;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
