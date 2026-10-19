@@ -2224,6 +2224,12 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
 
             const auto & prompt = *dp.prompt;
 
+            // deep context: verify batches cost more than these drafts save, leave it to the next drafter
+            if (params.max_depth > 0 && (int) prompt.size() > params.max_depth) {
+                sinfo.n_draft_last = 0;
+                continue;
+            }
+
             sinfo.sfx.draft(prompt.data(), prompt.size(), dp.id_last, result);
 
             // never exceed the declared n_max (n_min > n_max would allow it), which sizes the server's output limits

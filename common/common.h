@@ -370,6 +370,8 @@ struct common_params_speculative_ngram_suffix {
     int32_t n_max   = 32; // maximum draft length
 
     std::string policy = "match"; // match: max(n_min, backward match length), fixed: n_max, adapt: grow/shrink
+
+    int32_t max_depth = 0; // no drafts when the context holds more than this many tokens (0 = no limit)
 };
 
 struct common_params_speculative_ngram_map {

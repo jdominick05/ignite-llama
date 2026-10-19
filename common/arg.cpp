@@ -4376,6 +4376,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_suffix.policy = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-max-depth"}, "N",
+        string_format("ngram-suffix makes no drafts when the context holds more than N tokens, the next drafter in --spec-type still runs (default: %d, 0 = no limit)", params.speculative.ngram_suffix.max_depth),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ngram-suffix max-depth must be non-negative");
+            }
+            params.speculative.ngram_suffix.max_depth = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",
