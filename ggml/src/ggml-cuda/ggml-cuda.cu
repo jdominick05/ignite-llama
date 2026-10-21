@@ -4521,7 +4521,128 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// [ignite] IGNITE_PROF=<path>: per-op GPU timing for finding decode hot spots (dev only, slows decode down).
+// CUDA/HIP graphs are skipped, every executed node or fused chain gets an event pair, and after each graph the
+// stream is synchronized and the times are added up per op, separately for decode graphs (all mat-muls at batch 1)
+// and prompt graphs. <path>.dev<N>.txt is rewritten every 32 graphs.
+struct ignite_prof_entry {
+    double  ms = 0.0;
+    int64_t n  = 0;
+};
+
+struct ignite_prof_device {
+    std::map<std::string, ignite_prof_entry> tab[2];   // 0 = decode, 1 = prompt
+    int64_t graphs[2]   = {};
+    int64_t launches[2] = {};
+    double  wall_ms[2]  = {};   // host: graph_compute entry -> stream idle
+    double  span_ms[2]  = {};   // GPU: first event -> last event
+    double  sum_ms[2]   = {};   // GPU: sum over all timed nodes
+    std::vector<cudaEvent_t> events;
+    std::vector<std::string> labels;
+    int     n_used = 0;
+    int64_t t_start_us = 0;
+    int     cls = 0;
+};
+
+static const char * ignite_prof_path() {
+    static const char * path = getenv("IGNITE_PROF");
+    return path;
+}
+
+static ignite_prof_device & ignite_prof_dev(int device) {
+    static ignite_prof_device devs[GGML_CUDA_MAX_DEVICES];
+    return devs[device];
+}
+
+static int ignite_prof_class(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->ne[1] > 1) {
+            return 1;
+        }
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[1] && node->src[1]->ne[2] > 1) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static std::string ignite_prof_label(const ggml_cgraph * cgraph, int i, int n_fused) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    std::string label = ggml_op_desc(node);
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_GET_ROWS) && node->src[0]) {
+        label += std::string(" ") + ggml_type_name(node->src[0]->type);
+    }
+    if (n_fused > 0) {
+        label += std::string(" +") + std::to_string(n_fused) + " fused, last " + ggml_op_desc(cgraph->nodes[i + n_fused]);
+    }
+    return label;
+}
+
+static void ignite_prof_begin(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    ignite_prof_device & d = ignite_prof_dev(cuda_ctx->device);
+    d.t_start_us = ggml_time_us();
+    d.cls        = ignite_prof_class(cgraph);
+    d.n_used     = 0;
+    d.labels.clear();
+}
+
+static void ignite_prof_mark(ggml_backend_cuda_context * cuda_ctx) {
+    ignite_prof_device & d = ignite_prof_dev(cuda_ctx->device);
+    if ((size_t) d.n_used == d.events.size()) {
+        cudaEvent_t ev;
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDefault));
+        d.events.push_back(ev);
+    }
+    CUDA_CHECK(cudaEventRecord(d.events[d.n_used++], cuda_ctx->stream()));
+}
+
+static void ignite_prof_end(ggml_backend_cuda_context * cuda_ctx) {
+    ignite_prof_device & d = ignite_prof_dev(cuda_ctx->device);
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    const int c = d.cls;
+    d.graphs[c]++;
+    d.wall_ms[c] += (ggml_time_us() - d.t_start_us) / 1000.0;
+    for (size_t k = 0; k < d.labels.size(); ++k) {
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, d.events[2*k], d.events[2*k + 1]));
+        ignite_prof_entry & e = d.tab[c][d.labels[k]];
+        e.ms += ms;
+        e.n++;
+        d.sum_ms[c] += ms;
+    }
+    d.launches[c] += d.labels.size();
+    if (d.n_used >= 2) {
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, d.events[0], d.events[d.n_used - 1]));
+        d.span_ms[c] += ms;
+    }
+    if ((d.graphs[0] + d.graphs[1]) % 32 != 0) {
+        return;
+    }
+    const std::string path = std::string(ignite_prof_path()) + ".dev" + std::to_string(cuda_ctx->device) + ".txt";
+    FILE * f = fopen(path.c_str(), "w");
+    if (!f) {
+        return;
+    }
+    for (int k = 0; k < 2; ++k) {
+        const double g = (double) std::max<int64_t>(1, d.graphs[k]);
+        fprintf(f, "== %s graphs: %lld | per graph: wall %.3f ms, GPU span %.3f ms, GPU sum %.3f ms, timed launches %.1f\n",
+                k == 0 ? "decode" : "prompt", (long long) d.graphs[k], d.wall_ms[k] / g, d.span_ms[k] / g, d.sum_ms[k] / g,
+                d.launches[k] / g);
+        std::vector<std::pair<std::string, ignite_prof_entry>> rows(d.tab[k].begin(), d.tab[k].end());
+        std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
+        for (const auto & [label, e] : rows) {
+            fprintf(f, "%9.3f ms/graph %6.1f%% %8.1f calls/graph %9.2f us/call  %s\n", e.ms / g,
+                    100.0 * e.ms / std::max(1e-9, d.sum_ms[k]), e.n / g, 1000.0 * e.ms / std::max<int64_t>(1, e.n),
+                    label.c_str());
+        }
+    }
+    fclose(f);
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+    const bool prof = ignite_prof_path() != nullptr;
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4661,7 +4782,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (prof) {
+                    ignite_prof_mark(cuda_ctx);
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                if (prof && nodes_to_skip != 0) {
+                    ignite_prof_mark(cuda_ctx);
+                    ignite_prof_dev(cuda_ctx->device).labels.push_back(ignite_prof_label(cgraph, i, nodes_to_skip));
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -4695,6 +4825,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (prof) {
+                    ignite_prof_mark(cuda_ctx);
+                    ignite_prof_dev(cuda_ctx->device).labels.push_back(ignite_prof_label(cgraph, i, 0));
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4771,7 +4906,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (graph->is_enabled() && ignite_prof_path() == nullptr) {   // [ignite] IGNITE_PROF times nodes, so no capture
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -4814,7 +4949,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    if (ignite_prof_path() != nullptr) {
+        ignite_prof_begin(cuda_ctx, cgraph);
+    }
+
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (ignite_prof_path() != nullptr) {
+        ignite_prof_end(cuda_ctx);
+    }
 
     return GGML_STATUS_SUCCESS;
 }

@@ -1504,11 +1504,52 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// [ignite] IGNITE_PROF=<path>: host time per ubatch (memory apply, graph build/reuse, set_inputs, graph_compute),
+// decode (1 token) and prompt ubatches apart; written to <path>.host.txt every 32 ubatches. Pairs with the per-op GPU
+// timing of the same variable in ggml-cuda, which also makes graph_compute synchronous.
+struct ignite_host_prof {
+    int64_t n[2]       = {};
+    int64_t n_build[2] = {};
+    double  ms[2][4]   = {};   // apply, build, inputs, compute
+
+    void add(int c, bool built, const int64_t t[5]) {
+        n[c]++;
+        n_build[c] += built;
+        for (int k = 0; k < 4; ++k) {
+            ms[c][k] += (t[k + 1] - t[k]) / 1000.0;
+        }
+        const char * path = getenv("IGNITE_PROF");
+        if ((n[0] + n[1]) % 32 != 0 || !path) {
+            return;
+        }
+        FILE * f = fopen((std::string(path) + ".host.txt").c_str(), "w");
+        if (!f) {
+            return;
+        }
+        for (int k = 0; k < 2; ++k) {
+            const double g = (double) std::max<int64_t>(1, n[k]);
+            fprintf(f, "%s ubatches %lld (graph rebuilt %lld) | per ubatch ms: apply %.3f, build %.3f, set_inputs %.3f, compute %.3f\n",
+                    k == 0 ? "decode" : "prompt", (long long) n[k], (long long) n_build[k],
+                    ms[k][0] / g, ms[k][1] / g, ms[k][2] / g, ms[k][3] / g);
+        }
+        fclose(f);
+    }
+};
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    static const bool ignite_prof = getenv("IGNITE_PROF") != nullptr;
+    static ignite_host_prof ignite_host;
+    int64_t ignite_t[5] = { ignite_prof ? ggml_time_us() : 0 };
+    bool    ignite_built = false;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    if (ignite_prof) {
+        ignite_t[1] = ggml_time_us();
     }
 
     auto * res = get_gf_res_prev();
@@ -1555,6 +1596,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+        ignite_built = true;
+    }
+
+    if (ignite_prof) {
+        ignite_t[2] = ggml_time_us();
     }
 
     // set the input data for the input tensors
@@ -1567,11 +1613,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (ignite_prof) {
+        ignite_t[3] = ggml_time_us();
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (ignite_prof) {
+        ignite_t[4] = ggml_time_us();
+        ignite_host.add(ubatch.n_tokens > 1 ? 1 : 0, ignite_built, ignite_t);
     }
 
     ret = GGML_STATUS_SUCCESS;
