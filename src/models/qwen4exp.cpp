@@ -201,17 +201,26 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         // the converter pads the table; a model synthesised from metadata has no tensor to ask
+        // [ignite] a table may also be stored as super-rows of G consecutive rows ([G*ple_head_dim, n_rows/G]) so that
+        // 256-block types (Q2_K/Q3_K) fit the 160-wide rows; the gather then picks the row out of its super-row
+        int64_t ple_width = hparams.ple_head_dim;
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
         if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
-            if (ple_w->tensor->ne[1] < ple_rows) {
+            ple_width = ple_w->tensor->ne[0];
+            if (ple_width % hparams.ple_head_dim != 0) {
+                throw std::runtime_error(format("%s is %" PRId64 " wide, not a multiple of the PLE head dim %u",
+                                                ple_name.c_str(), ple_width, hparams.ple_head_dim));
+            }
+            const int64_t group = ple_width / hparams.ple_head_dim;
+            if (ple_w->tensor->ne[1] * group < ple_rows) {
                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
-                                                ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
+                                                ple_name.c_str(), ple_w->tensor->ne[1] * group, ple_rows));
             }
             ple_rows = ple_w->tensor->ne[1];
         }
 
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+                                           { ple_width, ple_rows }, TENSOR_READ_LAZY);
     }
 
     auto load_block = [&](int il, int flags) {
@@ -1209,7 +1218,8 @@ public:
         return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]; super-row index when the table is grouped
+    ggml_tensor * sub  = nullptr;   // I32 [ple_n_heads * n_tokens]; grouped table only: j*G + row%G
 
     const llama_model & model;
 
@@ -1281,9 +1291,20 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    {
-        ggml_tensor * ple = model.per_layer_tok_embd;
+    ggml_tensor * ple = model.per_layer_tok_embd;
 
+    // [ignite] grouped table: gather super-rows, then the row inside each (see build_inp_ple)
+    const int64_t group = ple->ne[0] / hparams.ple_head_dim;
+    if (group > 1) {
+        std::vector<int32_t> sub_idx(idx.size());
+        for (size_t j = 0; j < idx.size(); ++j) {
+            sub_idx[j] = (int32_t) (j * group + idx[j] % group);
+            idx[j]    /= (int32_t) group;
+        }
+        ggml_backend_tensor_set(sub, sub_idx.data(), 0, sub_idx.size()*ggml_element_size(sub));
+    }
+
+    {
         const bool prefetch = model.can_prefetch.count(ple);
         if (prefetch) {
             llama_prefetch_rows(ple, idx.data(), idx.size());
@@ -1359,10 +1380,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
     ggml_tensor * rows = ple_inp->rows;
+
+    // [ignite] grouped table ([G*head_dim, n_rows/G]): the super-rows come out as f32 [G*head_dim, n], viewed as
+    // G rows each, and a second, small gather picks row j*G + idx%G
+    const int64_t group = model.per_layer_tok_embd->ne[0] / hparams.ple_head_dim;
+    ggml_tensor * sub = nullptr;
+    if (group > 1) {
+        ple_inp->sub = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->sub);
+        sub = ple_inp->sub;
+    }
     res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
     ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    if (group > 1) {
+        emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim, group * n_heads * n_tokens);
+        emb = ggml_get_rows(ctx0, emb, sub);
+    }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 
