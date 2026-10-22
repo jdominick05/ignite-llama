@@ -74,6 +74,7 @@ struct mk_diag_entry {
 struct mk_diag {
     uint32_t      count;
     uint32_t      launches;
+    uint32_t      gdn_launches;
     uint32_t      idle[MK_STAGES];
     mk_diag_entry log[MK_DIAG_LOG];
 };
@@ -550,6 +551,7 @@ void ggml_cuda_megakernel_report(ggml_backend_cuda_context & ctx) {
     CUDA_CHECK(cudaMemcpy(&sync, ctx.mk_buf + MK_OFF_SYNC, sizeof(sync), cudaMemcpyDeviceToHost));
     mk_diag d;
     CUDA_CHECK(cudaMemcpy(&d, ctx.mk_buf + MK_BUF_SIZE + MK_PROF_SIZE, sizeof(d), cudaMemcpyDeviceToHost));
+    fprintf(stderr, "megakernel diag device %d: %u gdn launches\n", ctx.device, d.gdn_launches);
     fprintf(stderr, "megakernel diag device %d: grid %d, %u launches, err %d, %u timeouts, blocks without a task per "
             "stage %u/%u/%u/%u\n", ctx.device, ctx.mk_grid, d.launches, sync.err, d.count, d.idle[0], d.idle[1], d.idle[2],
             d.idle[3]);
@@ -808,6 +810,7 @@ struct mk_gdn_params {
     uint32_t *      cnt_v;          // [H]
     uint32_t *      cnt_k;          // [HK]
     uint32_t *      cnt_all;
+    mk_diag *       diag;           // GGML_CUDA_MEGAKERNEL_DIAG: launch count, else nullptr
     int             H;
     int             HK;
 };
@@ -855,6 +858,10 @@ static __global__ void mk_gdn_kernel(const mk_gdn_params p) {
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int tid  = MK_WARP_SIZE*warp + lane;
+
+    if (p.diag && blockIdx.x == 0 && mk_thread0()) {
+        atomicAdd(&p.diag->gdn_launches, 1u);
+    }
 
     const int h  = blockIdx.x / MK_GDN_QUARTERS;  // v head
     const int j  = blockIdx.x % MK_GDN_QUARTERS;  // column quarter
@@ -1134,6 +1141,7 @@ void ggml_cuda_mk_gdn_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk_gd
     p.cnt_v         = (uint32_t *) (scratch + MK_GDN_OFF_CNT);
     p.cnt_k         = p.cnt_v + MK_GDN_MAX_H;
     p.cnt_all       = p.cnt_k + MK_GDN_MAX_H;
+    p.diag          = mk_diag_enabled() ? (mk_diag *) (ctx.mk_buf + MK_BUF_SIZE + MK_PROF_SIZE) : nullptr;
     p.H             = m.H;
     p.HK            = m.HK;
 
