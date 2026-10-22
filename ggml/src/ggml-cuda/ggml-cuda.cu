@@ -4249,7 +4249,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }();
         ggml_tensor * a = node;
         ggml_tensor * b = cgraph->nodes[i + 1];
-        if (pair_enabled && b->op == GGML_OP_MUL_MAT && (b->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+        // gate + up feeding a GLU: leave them to the gate-fused MMVQ below, which also applies the GLU
+        const ggml_tensor * glu = i + 2 < cgraph->n_nodes ? cgraph->nodes[i + 2] : nullptr;
+        const bool feeds_glu = glu && glu->op == GGML_OP_GLU &&
+            ((glu->src[0] == a && glu->src[1] == b) || (glu->src[0] == b && glu->src[1] == a));
+        if (pair_enabled && !feeds_glu && b->op == GGML_OP_MUL_MAT && (b->flags & GGML_TENSOR_FLAG_COMPUTE) &&
                 b->src[1] == a->src[1] && b->src[0] != a && b->src[1] != a &&
                 a->src[0]->type == b->src[0]->type && a->src[0]->ne[0] == b->src[0]->ne[0] &&
                 a->src[0]->nb[1] == b->src[0]->nb[1] && ggml_is_matrix(a->src[0]) && ggml_is_matrix(b->src[0]) &&
