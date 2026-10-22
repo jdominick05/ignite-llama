@@ -5490,6 +5490,36 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
 // GGML_OP_MUL_MAT_ID
 // [ignite] two MUL_MAT on the same src1 (backend may reuse its quantized copy), then an in-place write to src1 and a
 // third MUL_MAT that must see the new values
+// [ignite] a + x*sigmoid(g), one gate value per row (qwen4exp shared expert); swapped: add operands swapped
+struct test_sigmoid_mul_add : public test_case {
+    const std::array<int64_t, 2> ne;
+    const bool swapped;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, swapped);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SIGMOID_MUL_ADD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_sigmoid_mul_add(std::array<int64_t, 2> ne = {2560, 1}, bool swapped = false) : ne(ne), swapped(swapped) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, ne[1]);
+        ggml_tensor * s = ggml_sigmoid(ctx, g);
+        ggml_tensor * m = ggml_mul(ctx, x, s);
+        ggml_tensor * out = swapped ? ggml_add(ctx, m, a) : ggml_add(ctx, a, m);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_shared_src1 : public test_case {
     const ggml_type type_a;
     const int64_t m;
@@ -10795,6 +10825,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 2557, 1, 640,  {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0,   GGML_TYPE_F32, 640,  1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 288, 10, false, 2560, 1, 640));
+    for (bool sw : {false, true}) {
+        test_cases.emplace_back(new test_sigmoid_mul_add({2560, 1}, sw));
+        test_cases.emplace_back(new test_sigmoid_mul_add({64, 5}, sw));
+        test_cases.emplace_back(new test_sigmoid_mul_add({2560, 256}, sw));
+    }
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL}) {
         test_cases.emplace_back(new test_mul_mat_shared_src1(t, 256, t == GGML_TYPE_Q6_K ? 2560 : 320));
     }

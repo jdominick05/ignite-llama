@@ -829,3 +829,60 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
             GGML_ABORT("Unsupported unary op for fused scale+unary");
     }
 }
+
+// [ignite] dst = a + x*sigmoid(g) with one gate value per row of x (qwen4exp shared expert: SIGMOID -> MUL -> ADD).
+// No FMA contraction (HIP's __fmul_rn does not prevent it), so the result matches the unfused ops bit for bit:
+// FN-R1 turns 1-ulp differences here into KLD 0.026 through its top-k selections.
+static __global__ void sigmoid_mul_add_kernel(const float * x, const float * g, const float * a, float * dst, const int64_t ne0, const int64_t k) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    {
+#pragma clang fp contract(off)
+        const float m = x[i]*op_sigmoid(g[i / ne0]);
+        dst[i] = a[i] + m;
+    }
+}
+
+// sigmoid_node = SIGMOID(g), mul_node = MUL(x, sigmoid_node) (either order), add_node = ADD(a, mul_node) (either order)
+bool ggml_cuda_sigmoid_mul_add_supported(const ggml_tensor * sigmoid_node, const ggml_tensor * mul_node, const ggml_tensor * add_node) {
+    static const bool enabled = !getenv("GGML_CUDA_SIGMOID_MUL_ADD") || atoi(getenv("GGML_CUDA_SIGMOID_MUL_ADD")) != 0;
+    if (!enabled || ggml_get_unary_op(sigmoid_node) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const ggml_tensor * g = sigmoid_node->src[0];
+    const ggml_tensor * x = mul_node->src[0] == sigmoid_node ? mul_node->src[1] : mul_node->src[0];
+    const ggml_tensor * a = add_node->src[0] == mul_node     ? add_node->src[1] : add_node->src[0];
+    if ((mul_node->src[0] != sigmoid_node && mul_node->src[1] != sigmoid_node) ||
+        (add_node->src[0] != mul_node && add_node->src[1] != mul_node)) {
+        return false;
+    }
+    for (const ggml_tensor * t : { g, x, a, (const ggml_tensor *) sigmoid_node, (const ggml_tensor *) mul_node, (const ggml_tensor *) add_node }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    // every thread reads g, so the output must not reuse its memory (the allocator may hand g's buffer to the ADD)
+    const char * g0 = (const char *) g->data;
+    const char * d0 = (const char *) add_node->data;
+    if (g0 < d0 + ggml_nbytes(add_node) && d0 < g0 + ggml_nbytes(g)) {
+        return false;
+    }
+    return g->ne[0] == 1 && ggml_nelements(g) == ggml_nrows(x) && ggml_are_same_shape(x, mul_node) &&
+           ggml_are_same_shape(a, add_node) && ggml_are_same_shape(mul_node, add_node);
+}
+
+void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_node, ggml_tensor * mul_node, ggml_tensor * add_node) {
+    const ggml_tensor * x = mul_node->src[0] == sigmoid_node ? mul_node->src[1] : mul_node->src[0];
+    const ggml_tensor * a = add_node->src[0] == mul_node     ? add_node->src[1] : add_node->src[0];
+    const int64_t k = ggml_nelements(add_node);
+    const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(sigmoid_mul_add_kernel, launch_params, (const float *) x->data, (const float *) sigmoid_node->src[0]->data,
+        (const float *) a->data, (float *) add_node->data, x->ne[0], k);
+}

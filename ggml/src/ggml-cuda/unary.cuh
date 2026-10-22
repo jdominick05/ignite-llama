@@ -99,6 +99,9 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
 bool ggml_cuda_scale_unary_supported(const ggml_tensor * scale_node, const ggml_tensor * unary_node);
 void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node);
 
+bool ggml_cuda_sigmoid_mul_add_supported(const ggml_tensor * sigmoid_node, const ggml_tensor * mul_node, const ggml_tensor * add_node);
+void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid_node, ggml_tensor * mul_node, ggml_tensor * add_node);
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }
