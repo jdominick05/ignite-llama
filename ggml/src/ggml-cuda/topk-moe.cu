@@ -127,6 +127,37 @@ __device__ void group_mask_warp_inplace(float (&vals)[experts_per_thread], const
 }
 #endif // !defined(GGML_USE_HIP) || HIP_VERSION >= 60300000
 
+#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3) || defined(RDNA4)) && WARP_SIZE == 32
+#define TOPK_MOE_DPP_ARGMAX
+// [ignite] the argmax rounds as a max over one 64-bit key per lane: orderable value bits above (65535 - expert), so the
+// larger value wins and ties go to the lower expert like the shuffle loop below. The cross-lane steps are DPP and
+// permlanex16 moves (VALU latency) instead of ds_bpermute round trips through LDS.
+static __device__ __forceinline__ uint32_t topk_moe_orderable(const float v) {
+    const uint32_t b = __float_as_uint(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+static __device__ __forceinline__ float topk_moe_unorderable(const uint32_t k) {
+    return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
+}
+template <int ctrl>
+static __device__ __forceinline__ uint64_t topk_moe_max_dpp(const uint64_t x) {
+    const uint32_t lo = __builtin_amdgcn_update_dpp(0u, (uint32_t) x,         ctrl, 0xf, 0xf, false);
+    const uint32_t hi = __builtin_amdgcn_update_dpp(0u, (uint32_t) (x >> 32), ctrl, 0xf, 0xf, false);
+    const uint64_t y = ((uint64_t) hi << 32) | lo;
+    return y > x ? y : x;
+}
+static __device__ __forceinline__ uint64_t topk_moe_wave_max(uint64_t x) {
+    x = topk_moe_max_dpp<0xB1>(x);  // quad_perm [1,0,3,2]: lane ^ 1
+    x = topk_moe_max_dpp<0x4E>(x);  // quad_perm [2,3,0,1]: lane ^ 2
+    x = topk_moe_max_dpp<0x164>(x); // row_xmask:4
+    x = topk_moe_max_dpp<0x168>(x); // row_xmask:8
+    const uint32_t lo = __builtin_amdgcn_permlanex16((uint32_t) x,         (uint32_t) x,         0x76543210u, 0xfedcba98u, false, false);
+    const uint32_t hi = __builtin_amdgcn_permlanex16((uint32_t) (x >> 32), (uint32_t) (x >> 32), 0x76543210u, 0xfedcba98u, false, false);
+    const uint64_t y = ((uint64_t) hi << 32) | lo;  // lane ^ 16
+    return y > x ? y : x;
+}
+#endif
+
 /*
     This kernel does the following:
     1. optionally softmax over the logits per token [n_experts, n_tokens]
@@ -278,6 +309,21 @@ __global__ void topk_moe_cuda(const float *         logits,
                 selection_wt[max_expert / WARP_SIZE] = -INFINITY;
             }
         } else {
+#ifdef TOPK_MOE_DPP_ARGMAX
+            static_assert(n_experts <= 65536, "expert index in 16 bits");
+            uint64_t key = 0;
+#pragma unroll
+            for (int i = 0; i < experts_per_thread; i++) {
+                const int expert = threadIdx.x + i * WARP_SIZE;
+                if (n_experts % WARP_SIZE == 0 || expert < n_experts) {
+                    const uint64_t k = ((uint64_t) topk_moe_orderable(wt[i]) << 32) | (uint32_t) (65535 - expert);
+                    key = k > key ? k : key;
+                }
+            }
+            key        = topk_moe_wave_max(key);
+            max_val    = topk_moe_unorderable((uint32_t) (key >> 32));
+            max_expert = 65535 - (int) (uint32_t) key;
+#else
 #pragma unroll
             for (int i = 1; i < experts_per_thread; i++) {
                 const int expert = threadIdx.x + i * WARP_SIZE;
@@ -296,6 +342,7 @@ __global__ void topk_moe_cuda(const float *         logits,
                     max_expert = expert;
                 }
             }
+#endif // TOPK_MOE_DPP_ARGMAX
 
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
                 wt[max_expert / WARP_SIZE] = -INFINITY;
