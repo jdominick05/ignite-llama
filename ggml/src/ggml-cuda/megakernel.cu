@@ -28,6 +28,9 @@ static constexpr int MK_MAX_K       = 16384; // hc down K = ncols*hc
 static constexpr int MK_MAX_LO      = 512;   // hc down rows = hc up K
 static constexpr int MK_MAX_GRID    = 1024;
 
+// stage 2 (down matvec, a row per task): K loop iterations of the 256-thread MMVQ block, held in registers at once
+static constexpr int MK_DOWN_ITERS = MK_MAX_K/QK8_0 / (VDR_Q8_0_Q8_1_MMVQ*MK_NWARPS*MK_WARP_SIZE/QI8_0);
+
 // Stages: 1 rms_norm*w + q8_1 (a task per stream), 2 down (+ inject) matvec (a task per row), 3 up matvec (a task per
 // MK_UP_ROWS rows), 4 gated hc_pre (a task per MK_PRE_COLS columns). Blocks claim tasks from a per-stage counter and
 // count finished ones in another; a stage waits only for the previous stage's done count. Nothing waits on a block
@@ -107,8 +110,6 @@ struct mk_hc_mix_params {
     block_q8_1 *  q8_act;
     mk_diag *     diag;       // GGML_CUDA_MEGAKERNEL_DIAG, else nullptr
     int           spin_limit; // GGML_CUDA_MEGAKERNEL_SPIN, default MK_SPIN_LIMIT
-    uint32_t      chunk_down; // tasks per claim
-    uint32_t      chunk_up;
 };
 
 #if defined(GGML_USE_HIP) && defined(RDNA3)
@@ -213,6 +214,35 @@ static __global__ void mk_hc_mix_kernel(const mk_hc_mix_params p) {
     const int      ncols4 = p.ncols/4;
     const int      nb_row = p.ncols/QK8_1;
 
+    constexpr int qi  = ggml_cuda_type_traits<GGML_TYPE_Q8_0>::qi;
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+
+    // stage 2's weights do not depend on stage 1: a block claims its first down task and loads that row's weights
+    // before waiting for stage 1 (not before stage 1 itself: the norm's loads would queue behind 3.5 MB of weights). A task is one row, as in the MMVQ pair launch (inject rows after the down rows); thread tid holds
+    // the blocks tid/4 + 64*it, quants 2*(tid%4), of every K loop iteration it.
+    const uint32_t ntask_down = p.down_rows + (has_inject ? p.inject_rows : 0);
+    const int      bpr_down   = K/QK8_0;
+    constexpr int  down_iter  = vdr*MK_NWARPS*MK_WARP_SIZE/qi;
+    const int      kqs_down   = vdr * (tid % (qi/vdr));
+    int  dv[MK_DOWN_ITERS][vdr];
+    half dd[MK_DOWN_ITERS];
+    auto load_down = [&](uint32_t t) {
+        const bool second = t >= p.down_rows;
+        const block_q8_0 * w = (const block_q8_0 *) (second ? p.fusion_down.second_x : p.w_down) +
+            (int64_t) (second ? t - p.down_rows : t)*p.down_stride_row;
+#pragma unroll
+        for (int it = 0; it < MK_DOWN_ITERS; ++it) {
+            const int kbx = tid/(qi/vdr) + down_iter*it;
+            if (kbx < bpr_down) {
+#pragma unroll
+                for (int k = 0; k < vdr; ++k) {
+                    dv[it][k] = get_int_b2(w[kbx].qs, kqs_down + k);
+                }
+                dd[it] = w[kbx].d;
+            }
+        }
+    };
+
     // stage 1, a task per (stream, MK_NWARPS q8_1 blocks of it): rms_norm_f32<1024, do_multiply, vec> owns one float4
     // per thread. Every task recomputes its stream's sum of squares (the row is 10 KB from L2) with warp w running that
     // kernel's warps w, w+8, w+16, w+24, so every partial sum and the final reduce happen in the same order; then warp w
@@ -269,18 +299,65 @@ static __global__ void mk_hc_mix_kernel(const mk_hc_mix_params p) {
         }
     });
     MK_PROF(1);
+    uint32_t td = mk_claim(&p.sync->claim[1], 1);
+    if (td < ntask_down) {
+        load_down(td);
+    }
     mk_wait(p, 0, p.hc*tasks_per_row);
     MK_PROF(2);
 
-    // stage 2: down matvec, inject in the second grid row like the MMVQ pair launch
-    const uint32_t ntask_down = p.down_rows + (has_inject ? p.inject_rows : 0);
-    mk_tasks(p, 1, ntask_down, p.chunk_down, [&](uint32_t t) {
-        const uint3 bi = t < p.down_rows ? make_uint3(t, 0, 0) : make_uint3(t - p.down_rows, 1, 0);
-        mul_mat_vec_q_impl<GGML_TYPE_Q8_0, 1, has_inject, false, false>(
-            p.w_down, p.q8_xn, nullptr, p.fusion_down, p.lo, K, make_uint3(0, 0, 0), p.down_stride_row,
-            GGML_PAD(K, MATRIX_ROW_PADDING)/QK8_1, p.down_rows, p.ratio1, 0, 0, 0, p.ratio1, 0, 0, 0, 0,
-            bi, has_inject ? 2 : 1);
-    });
+    // stage 2: down matvec, summed in mul_mat_vec_q's order: per thread over the K loop, warp 0 adds warps 1..7, the
+    // warp butterfly, and the fusion path's zero bias with inject
+    if (td >= ntask_down) {
+        if (p.diag && mk_thread0()) {
+            atomicAdd(&p.diag->idle[1], 1u);
+        }
+    } else {
+        __shared__ float s_red[MK_NWARPS-1][MK_WARP_SIZE];
+        for (;;) {
+            float tmp = 0.0f;
+#pragma unroll
+            for (int it = 0; it < MK_DOWN_ITERS; ++it) {
+                const int kbx = tid/(qi/vdr) + down_iter*it;
+                if (kbx < bpr_down) {
+                    int u[vdr];
+#pragma unroll
+                    for (int k = 0; k < vdr; ++k) {
+                        u[k] = get_int_b4(p.q8_xn[kbx].qs, kqs_down + k);
+                    }
+                    tmp += vec_dot_q8_0_q8_1_impl<float, vdr>(dv[it], u, dd[it], __low2half(p.q8_xn[kbx].ds));
+                }
+            }
+            if (warp > 0) {
+                s_red[warp-1][lane] = tmp;
+            }
+            __syncthreads();
+            if (warp == 0) {
+#pragma unroll
+                for (int l = 0; l < MK_NWARPS-1; ++l) {
+                    tmp += s_red[l][lane];
+                }
+                tmp = warp_reduce_sum<MK_WARP_SIZE>(tmp);
+                if (lane == 0) {
+                    float result = tmp;
+                    if constexpr (has_inject) {
+                        result += 0.0f;
+                    }
+                    if (td < p.down_rows) {
+                        p.lo[td] = result;
+                    } else {
+                        p.fusion_down.second_dst[td - p.down_rows] = result;
+                    }
+                }
+            }
+            mk_done(&p.sync->done[1], 1);
+            td = mk_claim(&p.sync->claim[1], 1);
+            if (td >= ntask_down) {
+                break;
+            }
+            load_down(td);
+        }
+    }
     MK_PROF(3);
 
     // stage 3: up matvec, MK_NWARPS*MK_UP_WARP_ROWS rows of gate per task. A block quantizes silu(s*lo + b) into its
@@ -291,8 +368,6 @@ static __global__ void mk_hc_mix_kernel(const mk_hc_mix_params p) {
     // sums in that kernel's order: thread tid = lane (+32) takes block tid/4, quants 2*(tid%4); warp 0's partial gets
     // warp 1's then the other warps' zeros added; then the warp butterfly. The weights do not depend on stage 2: the
     // first task is claimed and its weights loaded before waiting for stage 2.
-    constexpr int qi  = ggml_cuda_type_traits<GGML_TYPE_Q8_0>::qi;
-    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
     const uint32_t ntask_up = K/MK_UP_TASK_ROWS;
     const int bpr = p.down_rows/QK8_0;
     const int kb0 = lane / (qi/vdr);
@@ -623,16 +698,6 @@ void ggml_cuda_mk_hc_mix_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk
         return env ? atoi(env) : MK_SPIN_LIMIT;
     }();
     p.spin_limit    = spin_limit;
-    static const int chunk_down = [] {
-        const char * env = getenv("GGML_CUDA_MEGAKERNEL_CHUNK_DOWN");
-        return env ? atoi(env) : 2;
-    }();
-    static const int chunk_up = [] {
-        const char * env = getenv("GGML_CUDA_MEGAKERNEL_CHUNK_UP");
-        return env ? atoi(env) : 1;
-    }();
-    p.chunk_down    = std::max(chunk_down, 1);
-    p.chunk_up      = std::max(chunk_up, 1);
     p.q8_act        = (block_q8_1 *) (ctx.mk_buf + MK_OFF_Q8_ACT);
 
     cudaStream_t stream = ctx.stream();
