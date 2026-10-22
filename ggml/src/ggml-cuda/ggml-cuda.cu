@@ -5396,6 +5396,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 for (int j = i + 1; j <= i + nodes_to_skip; ++j) {
                     cuda_ctx->q8_1_cache_invalidate(cgraph->nodes[j]->data, ggml_nbytes(cgraph->nodes[j]));
                 }
+                cuda_ctx->q8_1_cache_commit();
 
                 if (prof && nodes_to_skip != 0) {
                     ignite_prof_mark(cuda_ctx);

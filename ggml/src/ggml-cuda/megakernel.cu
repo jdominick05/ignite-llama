@@ -120,6 +120,7 @@ struct mk_hc_mix_params {
     unsigned long long * prof; // GGML_CUDA_MEGAKERNEL_PROF: MK_PROF_POINTS wall clocks per block, else nullptr
     block_q8_1 *  q8_xn;
     block_q8_1 *  q8_act;
+    block_q8_1 *  q8_mixed; // q8_1 copy of mixed for the next MMVQ (nullptr: none); ncols % MATRIX_ROW_PADDING == 0
     mk_diag *     diag;       // GGML_CUDA_MEGAKERNEL_DIAG, else nullptr
     int           spin_limit; // GGML_CUDA_MEGAKERNEL_SPIN, default MK_SPIN_LIMIT
 };
@@ -503,7 +504,18 @@ static __global__ void mk_hc_mix_kernel(const mk_hc_mix_params p) {
                 wv = 1.0f / (1.0f + expf(-p.gate[i0 + ih*p.ncols]));
                 sum += xv * wv;
             }
-            p.mixed[i0] = p.pre_scale * sum;
+            const float v = p.pre_scale * sum;
+            p.mixed[i0] = v;
+            if (p.q8_mixed) { // whole warps: ncols is a multiple of the warp size here
+                float d;
+                float s;
+                const int8_t q = quantize_q8_1_lane(v, d, s);
+                block_q8_1 & y = p.q8_mixed[i0/QK8_1];
+                y.qs[i0 % QK8_1] = q;
+                if (i0 % QK8_1 == 0) {
+                    y.ds = make_half2(d, s);
+                }
+            }
         }
     });
     MK_PROF(7);
@@ -712,6 +724,11 @@ void ggml_cuda_mk_hc_mix_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk
     }();
     p.spin_limit    = spin_limit;
     p.q8_act        = (block_q8_1 *) (ctx.mk_buf + MK_OFF_Q8_ACT);
+    p.q8_mixed      = nullptr;
+    if (p.ncols % MATRIX_ROW_PADDING == 0 && ggml_is_contiguous(m.mixed) && ggml_nrows(m.mixed) == 1) {
+        p.q8_mixed = (block_q8_1 *) ctx.q8_1_cache_reserve(m.mixed->data, m.mixed->ne, m.mixed->nb, ggml_nbytes(m.mixed),
+                                                           p.ncols/QK8_1*sizeof(block_q8_1));
+    }
 
     cudaStream_t stream = ctx.stream();
     const dim3 block_dims(MK_WARP_SIZE, MK_NWARPS, 1);
@@ -807,6 +824,7 @@ struct mk_gdn_params {
     float *         out;
     float *         attn;           // scratch [128*H]
     float *         out_s;          // scratch [128*H]
+    block_q8_1 *    q8_out;         // q8_1 copy of out as a [128*H] row (nullptr: none)
     uint32_t *      cnt_v;          // [H]
     uint32_t *      cnt_k;          // [HK]
     uint32_t *      cnt_all;
@@ -1023,6 +1041,7 @@ static __global__ void mk_gdn_kernel(const mk_gdn_params p) {
         }
     }
 
+    __shared__ float4 s_o[MK_GDN_S/4];
     // the last of the 4 tasks of head h: rms_norm_f32<32, 1, vec, do_multiply>, then sigmoid(z)*x
     if (mk_last_of(&p.cnt_v[h], MK_GDN_QUARTERS) && warp == 0) {
         const float4 xs = ((const float4 *) (p.attn + h*S))[lane];
@@ -1043,6 +1062,24 @@ static __global__ void mk_gdn_kernel(const mk_gdn_params p) {
         o.z = mk_sigmoid(zz.z) * r.z;
         o.w = mk_sigmoid(zz.w) * r.w;
         ((float4 *) (p.out_s + h*S))[lane] = o;
+        if (p.q8_out) { // q8_1 copy of this head's 128 outputs for the ssm_out MMVQ, as quantize_q8_1 writes it
+            s_o[lane] = o;
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+            const float * so = (const float *) s_o;
+#pragma unroll
+            for (int ib = 0; ib < S/QK8_1; ++ib) {
+                float d;
+                float sum;
+                const int8_t q = quantize_q8_1_lane(so[QK8_1*ib + lane], d, sum);
+                block_q8_1 & y = p.q8_out[h*(S/QK8_1) + ib];
+                y.qs[lane] = q;
+                if (lane == 0) {
+                    y.ds = make_half2(d, sum);
+                }
+            }
+        }
     }
 
     // out may share memory with an input (gallocr reuses qkv for it): the last task, after every read, writes it
@@ -1138,6 +1175,11 @@ void ggml_cuda_mk_gdn_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk_gd
     p.out           = (float *) m.out->data;
     p.attn          = (float *) (scratch + MK_GDN_OFF_ATTN);
     p.out_s         = (float *) (scratch + MK_GDN_OFF_OUT);
+    p.q8_out        = nullptr;
+    if ((m.H*MK_GDN_S) % MATRIX_ROW_PADDING == 0 && ggml_is_contiguous(m.out)) {
+        p.q8_out = (block_q8_1 *) ctx.q8_1_cache_reserve_row(m.out->data, m.H*MK_GDN_S,
+                                                             m.H*MK_GDN_S/QK8_1*sizeof(block_q8_1));
+    }
     p.cnt_v         = (uint32_t *) (scratch + MK_GDN_OFF_CNT);
     p.cnt_k         = p.cnt_v + MK_GDN_MAX_H;
     p.cnt_all       = p.cnt_k + MK_GDN_MAX_H;

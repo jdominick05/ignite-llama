@@ -1487,6 +1487,53 @@ struct ggml_backend_cuda_context {
         for (q8_1_cache_slot & s : q8_1_cache) {
             s.src = nullptr;
         }
+        q8_1_cache_pending.src = nullptr;
+    }
+
+    // [ignite] a kernel writes the q8_1 copy of an f32 tensor itself: returns the slot buffer to write it into (nullptr: it
+    // does not fit). The slot holds the tensor (data, ne, nb as the consuming MMVQ's src1 has them) once
+    // q8_1_cache_commit runs, after the graph loop dropped the slots the nodes just run overwrote.
+    int                q8_1_cache_pending_slot = -1;
+    q8_1_cache_slot    q8_1_cache_pending      = {};
+
+    char * q8_1_cache_reserve(const void * data, const int64_t ne[GGML_MAX_DIMS], const size_t nb[GGML_MAX_DIMS],
+            size_t nbytes, size_t q8_1_size) {
+        if (q8_1_cache_buf == nullptr || !ggml_cuda_q8_1_cache_enabled() || q8_1_size > Q8_1_CACHE_SLOT_SIZE) {
+            return nullptr;
+        }
+        int k = 0;
+        for (int j = 0; j < Q8_1_CACHE_SLOTS; ++j) {
+            if (q8_1_cache[j].src == nullptr) {
+                k = j;
+                break;
+            }
+            if (q8_1_cache[j].last_use < q8_1_cache[k].last_use) {
+                k = j;
+            }
+        }
+        q8_1_cache[k].src          = nullptr;
+        q8_1_cache_pending_slot    = k;
+        q8_1_cache_pending.src     = data;
+        q8_1_cache_pending.nbytes  = nbytes;
+        memcpy(q8_1_cache_pending.ne, ne, sizeof(q8_1_cache_pending.ne));
+        memcpy(q8_1_cache_pending.nb, nb, sizeof(q8_1_cache_pending.nb));
+        return q8_1_cache_buf + k*Q8_1_CACHE_SLOT_SIZE;
+    }
+
+    // the same for a contiguous f32 row of n values at data
+    char * q8_1_cache_reserve_row(const void * data, int64_t n, size_t q8_1_size) {
+        const int64_t ne[GGML_MAX_DIMS] = { n, 1, 1, 1 };
+        const size_t  nb[GGML_MAX_DIMS] = { sizeof(float), n*sizeof(float), n*sizeof(float), n*sizeof(float) };
+        return q8_1_cache_reserve(data, ne, nb, n*sizeof(float), q8_1_size);
+    }
+
+    void q8_1_cache_commit() {
+        if (q8_1_cache_pending.src == nullptr) {
+            return;
+        }
+        q8_1_cache_pending.last_use = ++q8_1_cache_tick;
+        q8_1_cache[q8_1_cache_pending_slot] = q8_1_cache_pending;
+        q8_1_cache_pending.src = nullptr;
     }
 
     // drop slots whose src1 overlaps [data, data + size)
