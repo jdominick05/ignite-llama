@@ -91,6 +91,10 @@ static constexpr size_t MK_GDN_OFF_CNT  = MK_GDN_OFF_OUT  + (size_t) MK_GDN_MAX_
 static constexpr size_t MK_GDN_SIZE     = MK_GDN_OFF_CNT + (2*MK_GDN_MAX_H + 1)*sizeof(uint32_t);
 static constexpr size_t MK_GDN_BASE     = MK_BUF_SIZE + MK_PROF_SIZE + MK_DIAG_SIZE;
 
+// router + topk (topk-moe.cu): a counter, then the logits
+static constexpr size_t MK_ROUTER_BASE = (MK_GDN_BASE + MK_GDN_SIZE + 255)/256*256;
+static constexpr size_t MK_ROUTER_SIZE = 256 + 1024*sizeof(float);
+
 // bounded spin: a scheduling or logic mistake sets the error flag instead of hanging the GPU
 static constexpr int MK_SPIN_LIMIT = 1 << 26;
 
@@ -622,8 +626,8 @@ void ggml_cuda_megakernel_prepare(ggml_backend_cuda_context & ctx) {
         return;
     }
 
-    CUDA_CHECK(cudaMalloc((void **) &ctx.mk_buf, MK_GDN_BASE + MK_GDN_SIZE));
-    CUDA_CHECK(cudaMemset(ctx.mk_buf, 0, MK_GDN_BASE + MK_GDN_SIZE));
+    CUDA_CHECK(cudaMalloc((void **) &ctx.mk_buf, MK_ROUTER_BASE + MK_ROUTER_SIZE));
+    CUDA_CHECK(cudaMemset(ctx.mk_buf, 0, MK_ROUTER_BASE + MK_ROUTER_SIZE));
     ctx.mk_grid = grid;
     GGML_LOG_INFO("%s: device %d: megakernel grid %d (%d blocks per WGP, occupancy %d/%d%s)\n",
                   __func__, ctx.device, grid, bpw, occ_a, occ_b, oversub ? ", oversubscribed" : "");
@@ -1309,7 +1313,17 @@ bool ggml_cuda_mk_ffn_tail_supported(const ggml_cuda_mk_ffn_tail & m) {
             m.residual->ne[0] != n_embd || !f32c(m.inject, hc) || !f32c(m.dst, n_embd*hc)) {
         return false;
     }
-    return ((uintptr_t) m.w_sg->data | (uintptr_t) m.x->data) % 8 == 0;
+    // the gate row is bit-identical to mul_mat_vec_f only where that picks 256 threads
+    int64_t block_size_best = MK_WARP_SIZE;
+    int64_t niter_best      = (n_embd + 2*MK_WARP_SIZE - 1) / (2*MK_WARP_SIZE);
+    for (int64_t block_size = 2*MK_WARP_SIZE; block_size <= MK_TAIL_THREADS; block_size += MK_WARP_SIZE) {
+        const int64_t niter = (n_embd + 2*block_size - 1) / (2*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+    return block_size_best == MK_TAIL_THREADS && ((uintptr_t) m.w_sg->data | (uintptr_t) m.x->data) % 8 == 0;
 }
 
 void ggml_cuda_mk_ffn_tail_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk_ffn_tail & m) {
@@ -1333,3 +1347,16 @@ void ggml_cuda_mk_ffn_tail_run(ggml_backend_cuda_context & ctx, const ggml_cuda_
     mk_ffn_tail_kernel<<<nblocks, MK_TAIL_THREADS, 0, ctx.stream()>>>(p);
     CUDA_CHECK(cudaGetLastError());
 }
+
+void * ggml_cuda_mk_router_scratch(ggml_backend_cuda_context & ctx) {
+    return ctx.mk_buf + MK_ROUTER_BASE;
+}
+
+bool ggml_cuda_mk_router_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MEGAKERNEL_ROUTER");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+

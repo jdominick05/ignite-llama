@@ -108,3 +108,8 @@ bool ggml_cuda_mk_ffn_tail_enabled();
 bool ggml_cuda_mk_ffn_tail_supported(const ggml_cuda_mk_ffn_tail & m);
 
 void ggml_cuda_mk_ffn_tail_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk_ffn_tail & m);
+
+// scratch for ggml_cuda_router_topk_moe (topk-moe.cuh), zeroed at allocation; GGML_CUDA_MEGAKERNEL_ROUTER=0 turns it off
+void * ggml_cuda_mk_router_scratch(ggml_backend_cuda_context & ctx);
+
+bool ggml_cuda_mk_router_enabled();
