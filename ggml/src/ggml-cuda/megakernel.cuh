@@ -113,3 +113,37 @@ void ggml_cuda_mk_ffn_tail_run(ggml_backend_cuda_context & ctx, const ggml_cuda_
 void * ggml_cuda_mk_router_scratch(ggml_backend_cuda_context & ctx);
 
 bool ggml_cuda_mk_router_enabled();
+
+// In-order executor for a run of small graph nodes: one block runs the nodes in graph order, each writing its own
+// tensor, with a barrier between nodes, so it computes what the per-node kernels compute, in one launch. Each op
+// uses the arithmetic of its CUDA kernel (fill, cpy, repeat/add/sub/mul via bin_bcast, get_rows, set_rows, scale,
+// clamp, concat, cumsum). Tensors are at most 2-D with contiguous rows.
+// GGML_CUDA_MEGAKERNEL_SEQ=0 turns it off; GGML_CUDA_MEGAKERNEL_SEQ_MIN sets the minimum run length (default 8).
+static constexpr int MK_SEQ_MAX_NODES = 40;
+
+struct mk_seq_node {
+    const char * a;
+    const char * b;
+    char *       d;
+    int32_t      ne0, ne1;          // dst
+    int32_t      a_ne0, a_ne1;
+    int32_t      b_ne0, b_ne1;
+    int32_t      d_s1, a_s1, b_s1;  // row strides in elements
+    int32_t      dim;               // concat
+    float        f0, f1;            // fill value; scale, bias; clamp min, max
+    uint8_t      op, td, ta, tb;    // mk_seq_op, ggml_type
+    uint8_t      sync;              // barrier before this node: it touches memory an earlier node since the last barrier wrote, or writes memory one read
+};
+
+struct mk_seq_params {
+    int         n;
+    mk_seq_node nodes[MK_SEQ_MAX_NODES];
+};
+
+bool ggml_cuda_mk_seq_enabled();
+int  ggml_cuda_mk_seq_min_nodes();
+
+// fills nd from graph node t, false if the executor cannot run it
+bool ggml_cuda_mk_seq_node_supported(const ggml_tensor * t, mk_seq_node & nd);
+
+void ggml_cuda_mk_seq_run(ggml_backend_cuda_context & ctx, const mk_seq_params & p);

@@ -1,4 +1,5 @@
 #include "megakernel.cuh"
+#include "convert.cuh"
 #include "mmvq-impl.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -1360,3 +1361,403 @@ bool ggml_cuda_mk_router_enabled() {
     return enabled;
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------------
+// in-order small-op executor
+
+enum mk_seq_op : uint8_t {
+    MK_SEQ_FILL, MK_SEQ_CPY, MK_SEQ_REPEAT, MK_SEQ_GET_ROWS, MK_SEQ_SET_ROWS, MK_SEQ_SCALE, MK_SEQ_CLAMP,
+    MK_SEQ_CONCAT, MK_SEQ_CUMSUM, MK_SEQ_ADD, MK_SEQ_SUB, MK_SEQ_MUL,
+};
+
+static constexpr int MK_SEQ_THREADS = 1024;
+// one block: larger nodes end the run and launch on their own (the QSA mask's n_kv-sized f16 ops at depth)
+static constexpr int64_t MK_SEQ_MAX_ELEMS = 16384;
+
+static __device__ __forceinline__ float mk_seq_load(const char * p, uint8_t t, int64_t i) {
+    switch (t) {
+        case GGML_TYPE_F32: return ((const float *) p)[i];
+        case GGML_TYPE_F16: return ggml_cuda_cast<float>(((const half *) p)[i]);
+        default:            return ggml_cuda_cast<float>(((const int32_t *) p)[i]);
+    }
+}
+
+static __device__ __forceinline__ void mk_seq_store(char * p, uint8_t t, int64_t i, float v) {
+    switch (t) {
+        case GGML_TYPE_F32: ((float *)   p)[i] = v; break;
+        case GGML_TYPE_F16: ((half *)    p)[i] = ggml_cuda_cast<half>(v); break;
+        default:            ((int32_t *) p)[i] = ggml_cuda_cast<int32_t>(v); break;
+    }
+}
+
+// a same-type element copy (get_rows, set_rows, concat between equal types)
+static __device__ __forceinline__ void mk_seq_copy(char * d, int64_t id, const char * a, int64_t ia, uint8_t t) {
+    if (t == GGML_TYPE_F16) {
+        ((half *) d)[id] = ((const half *) a)[ia];
+    } else {
+        ((int32_t *) d)[id] = ((const int32_t *) a)[ia];
+    }
+}
+
+static __device__ __forceinline__ int64_t mk_seq_index(const char * b, uint8_t t, int64_t i) {
+    return t == GGML_TYPE_I64 ? ((const int64_t *) b)[i] : ((const int32_t *) b)[i];
+}
+
+static __device__ __forceinline__ float mk_seq_binop(uint8_t op, float x, float y) {
+    switch (op) {
+        case MK_SEQ_ADD: return x + y;
+        case MK_SEQ_SUB: return x - y;
+        default:         return x * y;
+    }
+}
+
+// cumsum_kernel<float> for one row, as launched with block_size threads (min(ne0 rounded to a warp, 256)); every
+// thread of the executor block reaches the barriers
+static __device__ void mk_seq_cumsum_row(const float * src_row, float * dst_row, const int64_t ne00, const int block_size,
+                                         float * s_vals, float * s_warp_sums, float * s_carry, float * s_chunk_total) {
+    constexpr int warp_size = MK_WARP_SIZE;
+    const int  tid    = threadIdx.x;
+    const int  lane   = tid % warp_size;
+    const int  warp   = tid / warp_size;
+    const int  warps_per_block = block_size / warp_size;
+    const bool active = tid < block_size;
+
+    if (tid == 0) {
+        *s_carry = 0.0f;
+    }
+    __syncthreads();
+
+    constexpr int num_unroll = 4;
+    float         temp[num_unroll];
+
+    for (int64_t i = 0; i < ne00; i += num_unroll * block_size) {
+        const int64_t idx = i + tid * num_unroll;
+        float val = 0.0f;
+        if (active) {
+            temp[0] = (idx < ne00 ? src_row[idx] : 0.0f);
+#pragma unroll
+            for (int64_t j = 1; j < num_unroll; j++) {
+                temp[j] = temp[j - 1];
+                if (idx + j < ne00) {
+                    temp[j] += src_row[idx + j];
+                } else {
+                    temp[j] += 0;
+                }
+            }
+            val = (idx < ne00) ? temp[num_unroll - 1] : 0.0f;
+            val = warp_prefix_inclusive_sum<float, warp_size>(val);
+            s_vals[tid] = val;
+            if (lane == warp_size - 1) {
+                s_warp_sums[warp] = val;
+            }
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+            float w = (tid < warps_per_block) ? s_warp_sums[tid] : 0.0f;
+            float inc = warp_prefix_inclusive_sum<float, warp_size>(w);
+            if (tid < warps_per_block) {
+                s_warp_sums[tid] = inc - w;
+            }
+            if (tid == warps_per_block - 1) {
+                *s_chunk_total = inc;
+            }
+        }
+        __syncthreads();
+
+        if (active) {
+            float carry = *s_carry;
+            float final_val_offset = s_vals[tid] + s_warp_sums[warp] + carry - temp[num_unroll - 1];
+#pragma unroll
+            for (int32_t j = 0; j < num_unroll; j++) {
+                if (idx + j < ne00) {
+                    dst_row[idx + j] = temp[j] + final_val_offset;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            *s_carry += *s_chunk_total;
+        }
+        __syncthreads();
+    }
+}
+
+__launch_bounds__(MK_SEQ_THREADS, 1)
+static __global__ void mk_seq_kernel(const mk_seq_params p) {
+#ifdef MK_DEVICE_CODE
+    __shared__ float s_vals[256];
+    __shared__ float s_warp_sums[256/MK_WARP_SIZE];
+    __shared__ float s_carry;
+    __shared__ float s_chunk_total;
+    const int tid = threadIdx.x;
+
+    for (int k = 0; k < p.n; ++k) {
+        const mk_seq_node & nd = p.nodes[k];
+        const int64_t n = (int64_t) nd.ne0*nd.ne1;
+        if (nd.sync) {
+            __syncthreads();
+        }
+        switch (nd.op) {
+            case MK_SEQ_FILL: {
+                for (int64_t e = tid; e < n; e += MK_SEQ_THREADS) {
+                    if (nd.td == GGML_TYPE_F16) {
+                        ((half *) nd.d)[(e / nd.ne0)*nd.d_s1 + e % nd.ne0] = ggml_cuda_cast<half>(nd.f0);
+                    } else {
+                        ((float *) nd.d)[(e / nd.ne0)*nd.d_s1 + e % nd.ne0] = nd.f0;
+                    }
+                }
+            } break;
+            case MK_SEQ_CPY: {
+                for (int64_t e = tid; e < n; e += MK_SEQ_THREADS) {
+                    const int64_t i0 = e % nd.ne0;
+                    const int64_t i1 = e / nd.ne0;
+                    const int64_t ia = (e / nd.a_ne0)*nd.a_s1 + e % nd.a_ne0;
+                    if (nd.ta == nd.td) {
+                        mk_seq_copy(nd.d, i1*nd.d_s1 + i0, nd.a, ia, nd.td);
+                    } else if (nd.ta == GGML_TYPE_F32 && nd.td == GGML_TYPE_I32) {
+                        ((int32_t *) nd.d)[i1*nd.d_s1 + i0] = ggml_cuda_cast<int32_t>(((const float *) nd.a)[ia]);
+                    } else {
+                        mk_seq_store(nd.d, nd.td, i1*nd.d_s1 + i0, mk_seq_load(nd.a, nd.ta, ia));
+                    }
+                }
+            } break;
+            case MK_SEQ_REPEAT: { // bin_bcast<op_repeat>: through float
+                for (int64_t e = tid; e < n; e += MK_SEQ_THREADS) {
+                    const int64_t i0 = e % nd.ne0;
+                    const int64_t i1 = e / nd.ne0;
+                    const float v = mk_seq_load(nd.a, nd.ta, (i1 % nd.a_ne1)*nd.a_s1 + i0 % nd.a_ne0);
+                    mk_seq_store(nd.d, nd.td, i1*nd.d_s1 + i0, v);
+                }
+            } break;
+            case MK_SEQ_GET_ROWS: {
+                for (int64_t e = tid; e < n; e += MK_SEQ_THREADS) {
+                    const int64_t i0 = e % nd.ne0;
+                    const int64_t i1 = e / nd.ne0;
+                    const int64_t r  = mk_seq_index(nd.b, nd.tb, i1);
+                    mk_seq_copy(nd.d, i1*nd.d_s1 + i0, nd.a, r*nd.a_s1 + i0, nd.td);
+                }
+            } break;
+            case MK_SEQ_SET_ROWS: {
+                const int64_t ns = (int64_t) nd.a_ne0*nd.a_ne1;
+                for (int64_t e = tid; e < ns; e += MK_SEQ_THREADS) {
+                    const int64_t i0 = e % nd.a_ne0;
+                    const int64_t i1 = e / nd.a_ne0;
+                    const int64_t r  = mk_seq_index(nd.b, nd.tb, i1);
+                    if (nd.ta == nd.td) {
+                        mk_seq_copy(nd.d, r*nd.d_s1 + i0, nd.a, i1*nd.a_s1 + i0, nd.td);
+                    } else {
+                        mk_seq_store(nd.d, nd.td, r*nd.d_s1 + i0, mk_seq_load(nd.a, nd.ta, i1*nd.a_s1 + i0));
+                    }
+                }
+            } break;
+            case MK_SEQ_SCALE: {
+                const float scale = nd.f0;
+                const float bias  = nd.f1;
+                for (int64_t e = tid; e < n; e += MK_SEQ_THREADS) {
+                    const int64_t i0 = e % nd.ne0;
+                    const int64_t i1 = e / nd.ne0;
+                    const float * x = (const float *) nd.a;
+                    ((float *) nd.d)[i1*nd.d_s1 + i0] = ggml_cuda_cast<float>(scale * ggml_cuda_cast<float>(x[i1*nd.a_s1 + i0]) + bias);
+                }
+            } break;
+            case MK_SEQ_CLAMP: {
+                for (int64_t e = tid; e < n; e += MK_SEQ_THREADS) {
+                    const int64_t i0 = e % nd.ne0;
+                    const int64_t i1 = e / nd.ne0;
+                    const float x = ((const float *) nd.a)[i1*nd.a_s1 + i0];
+                    ((float *) nd.d)[i1*nd.d_s1 + i0] = fminf(fmaxf(x, nd.f0), nd.f1);
+                }
+            } break;
+            case MK_SEQ_CONCAT: {
+                for (int64_t e = tid; e < n; e += MK_SEQ_THREADS) {
+                    const int64_t i0 = e % nd.ne0;
+                    const int64_t i1 = e / nd.ne0;
+                    const bool    in_a = nd.dim == 0 ? i0 < nd.a_ne0 : i1 < nd.a_ne1;
+                    const int64_t is = in_a ? i1*nd.a_s1 + i0 :
+                        nd.dim == 0 ? i1*nd.b_s1 + (i0 - nd.a_ne0) : (i1 - nd.a_ne1)*nd.b_s1 + i0;
+                    mk_seq_copy(nd.d, i1*nd.d_s1 + i0, in_a ? nd.a : nd.b, is, nd.td);
+                }
+            } break;
+            case MK_SEQ_CUMSUM: {
+                const int block_size = min((nd.ne0 + MK_WARP_SIZE - 1)/MK_WARP_SIZE*MK_WARP_SIZE, 256);
+                for (int64_t i1 = 0; i1 < nd.ne1; ++i1) {
+                    mk_seq_cumsum_row((const float *) nd.a + i1*nd.a_s1, (float *) nd.d + i1*nd.d_s1, nd.ne0, block_size,
+                                      s_vals, s_warp_sums, &s_carry, &s_chunk_total);
+                }
+            } break;
+            default: { // ADD, SUB, MUL: bin_bcast, src1 broadcast
+                for (int64_t e = tid; e < n; e += MK_SEQ_THREADS) {
+                    const int64_t i0 = e % nd.ne0;
+                    const int64_t i1 = e / nd.ne0;
+                    const float x = mk_seq_load(nd.a, nd.ta, i1*nd.a_s1 + i0);
+                    const float y = mk_seq_load(nd.b, nd.tb, (i1 % nd.b_ne1)*nd.b_s1 + i0 % nd.b_ne0);
+                    mk_seq_store(nd.d, nd.td, i1*nd.d_s1 + i0, mk_seq_binop(nd.op, x, y));
+                }
+            } break;
+        }
+    }
+#else
+    GGML_UNUSED(p);
+    NO_DEVICE_CODE;
+#endif // MK_DEVICE_CODE
+}
+
+bool ggml_cuda_mk_seq_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MEGAKERNEL_SEQ");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+int ggml_cuda_mk_seq_min_nodes() {
+    static const int n = [] {
+        const char * env = getenv("GGML_CUDA_MEGAKERNEL_SEQ_MIN");
+        return env ? std::max(1, atoi(env)) : 8;
+    }();
+    return n;
+}
+
+// at most 2-D, contiguous rows, row strides that fit in 32 bits
+static bool mk_seq_tensor_ok(const ggml_tensor * t) {
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_I32) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(t->type);
+    return t->ne[2] == 1 && t->ne[3] == 1 && t->nb[0] == ts && t->nb[1] % ts == 0 && t->nb[1]/ts < INT32_MAX &&
+        t->ne[0] < INT32_MAX && t->ne[1] < INT32_MAX && t->ne[0]*t->ne[1] <= MK_SEQ_MAX_ELEMS && t->data != nullptr;
+}
+
+bool ggml_cuda_mk_seq_node_supported(const ggml_tensor * t, mk_seq_node & nd) {
+    nd = {};
+    if (!mk_seq_tensor_ok(t)) {
+        return false;
+    }
+    const ggml_tensor * a = t->src[0];
+    const ggml_tensor * b = t->src[1];
+    nd.d    = (char *) t->data;
+    nd.ne0  = (int32_t) t->ne[0];
+    nd.ne1  = (int32_t) t->ne[1];
+    nd.d_s1 = (int32_t) (t->nb[1] / ggml_type_size(t->type));
+    nd.td   = t->type;
+    auto set_a = [&](const ggml_tensor * x) {
+        nd.a = (const char *) x->data; nd.a_ne0 = (int32_t) x->ne[0]; nd.a_ne1 = (int32_t) x->ne[1];
+        nd.a_s1 = (int32_t) (x->nb[1] / ggml_type_size(x->type)); nd.ta = x->type;
+    };
+    auto set_b = [&](const ggml_tensor * x) {
+        nd.b = (const char *) x->data; nd.b_ne0 = (int32_t) x->ne[0]; nd.b_ne1 = (int32_t) x->ne[1];
+        nd.b_s1 = (int32_t) (x->nb[1] / ggml_type_size(x->type)); nd.tb = x->type;
+    };
+    const bool f32 = t->type == GGML_TYPE_F32;
+    switch (t->op) {
+        case GGML_OP_FILL:
+            if (t->type == GGML_TYPE_I32 || !ggml_is_contiguous(t)) {
+                return false;
+            }
+            nd.op = MK_SEQ_FILL;
+            memcpy(&nd.f0, t->op_params, sizeof(float));
+            return true;
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+            // cpy_scalar_contiguous; the conversions it has
+            if (!mk_seq_tensor_ok(a) || !ggml_is_contiguous(a) || !ggml_is_contiguous(t) ||
+                    ggml_nelements(a) != ggml_nelements(t) ||
+                    !(a->type == t->type || (a->type == GGML_TYPE_F32 && t->type != GGML_TYPE_F32) ||
+                      (t->type == GGML_TYPE_F32 && a->type != GGML_TYPE_F32))) {
+                return false;
+            }
+            if (t->op == GGML_OP_CPY && t->src[1] != nullptr && t->src[1]->data != t->data) {
+                return false;
+            }
+            nd.op = MK_SEQ_CPY;
+            set_a(a);
+            return true;
+        case GGML_OP_REPEAT:
+            if (!mk_seq_tensor_ok(a) || t->type == GGML_TYPE_I32 || a->type != t->type ||
+                    t->ne[0] % a->ne[0] != 0 || t->ne[1] % a->ne[1] != 0) {
+                return false;
+            }
+            nd.op = MK_SEQ_REPEAT;
+            set_a(a);
+            return true;
+        case GGML_OP_GET_ROWS:
+            if (!mk_seq_tensor_ok(a) || a->type != t->type || t->type == GGML_TYPE_F16 || b->type != GGML_TYPE_I32 ||
+                    b->ne[1] != 1 || b->ne[2] != 1 || b->ne[3] != 1 || b->ne[0] != t->ne[1] || a->ne[0] != t->ne[0] ||
+                    !ggml_is_contiguous(b)) {
+                return false;
+            }
+            nd.op = MK_SEQ_GET_ROWS;
+            set_a(a);
+            set_b(b);
+            return true;
+        case GGML_OP_SET_ROWS:
+            if (!mk_seq_tensor_ok(a) || t->type == GGML_TYPE_I32 || (a->type != t->type && a->type != GGML_TYPE_F32) ||
+                    (b->type != GGML_TYPE_I32 && b->type != GGML_TYPE_I64) || b->ne[1] != 1 || b->ne[2] != 1 ||
+                    b->ne[3] != 1 || b->ne[0] != a->ne[1] || a->ne[0] != t->ne[0] || !ggml_is_contiguous(b)) {
+                return false;
+            }
+            nd.op = MK_SEQ_SET_ROWS;
+            set_a(a);
+            nd.b = (const char *) b->data; nd.b_ne0 = (int32_t) b->ne[0]; nd.b_ne1 = 1; nd.tb = b->type;
+            return true;
+        case GGML_OP_SCALE:
+            if (!f32 || !mk_seq_tensor_ok(a) || a->type != GGML_TYPE_F32 || !ggml_are_same_shape(a, t)) {
+                return false;
+            }
+            nd.op = MK_SEQ_SCALE;
+            nd.f0 = ggml_get_op_params_f32(t, 0);
+            nd.f1 = ggml_get_op_params_f32(t, 1);
+            set_a(a);
+            return true;
+        case GGML_OP_CLAMP:
+            if (!f32 || !mk_seq_tensor_ok(a) || a->type != GGML_TYPE_F32 || !ggml_are_same_shape(a, t)) {
+                return false;
+            }
+            nd.op = MK_SEQ_CLAMP;
+            nd.f0 = ggml_get_op_params_f32(t, 0);
+            nd.f1 = ggml_get_op_params_f32(t, 1);
+            set_a(a);
+            return true;
+        case GGML_OP_CONCAT: {
+            const int dim = ggml_get_op_params_i32(t, 0);
+            if (t->type == GGML_TYPE_F16 || !mk_seq_tensor_ok(a) || !mk_seq_tensor_ok(b) || a->type != t->type ||
+                    b->type != t->type || (dim != 0 && dim != 1) || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) ||
+                    !ggml_is_contiguous(t)) {
+                return false;
+            }
+            nd.op  = MK_SEQ_CONCAT;
+            nd.dim = dim;
+            set_a(a);
+            set_b(b);
+            return true;
+        }
+        case GGML_OP_CUMSUM:
+            if (!f32 || !mk_seq_tensor_ok(a) || a->type != GGML_TYPE_F32 || !ggml_are_same_shape(a, t)) {
+                return false;
+            }
+            nd.op = MK_SEQ_CUMSUM;
+            set_a(a);
+            return true;
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+            if (t->type == GGML_TYPE_I32 || !mk_seq_tensor_ok(a) || !mk_seq_tensor_ok(b) || a->type == GGML_TYPE_I32 ||
+                    b->type == GGML_TYPE_I32 || !ggml_are_same_shape(a, t) || t->ne[0] % b->ne[0] != 0 ||
+                    t->ne[1] % b->ne[1] != 0) {
+                return false;
+            }
+            nd.op = t->op == GGML_OP_ADD ? MK_SEQ_ADD : t->op == GGML_OP_SUB ? MK_SEQ_SUB : MK_SEQ_MUL;
+            set_a(a);
+            set_b(b);
+            return true;
+        default:
+            return false;
+    }
+}
+
+void ggml_cuda_mk_seq_run(ggml_backend_cuda_context & ctx, const mk_seq_params & p) {
+    mk_seq_kernel<<<1, MK_SEQ_THREADS, 0, ctx.stream()>>>(p);
+    CUDA_CHECK(cudaGetLastError());
+}

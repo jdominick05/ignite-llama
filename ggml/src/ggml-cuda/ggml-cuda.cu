@@ -4232,6 +4232,63 @@ static int ggml_cuda_match_topk_moe(const ggml_cgraph * cgraph, int i, const ggm
     return 0;
 }
 
+// [ignite] a run of small nodes from node i for the in-order executor; returns the index of the last node, 0 when the
+// run is shorter than the minimum. The run stops before an ADD or MUL chain that the per-node path fuses.
+static int ggml_cuda_match_mk_seq(const ggml_cgraph * cgraph, int i, mk_seq_params & p) {
+    p.n = 0;
+    int last = 0;
+    // byte ranges read and written since the last barrier: a node that reads what was written, or writes what was read
+    // or written, waits for the barrier (CUMSUM has its own internal ones but still synchronizes here)
+    struct range { const char * a; const char * b; };
+    std::vector<range> rd, wr;
+    const auto rng = [](const ggml_tensor * t) { return range{ (const char *) t->data, (const char *) t->data + ggml_nbytes(t) }; };
+    const auto hits = [](const std::vector<range> & v, range r) {
+        for (const range & x : v) {
+            if (r.a < x.b && x.a < r.b) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (int j = i; j < cgraph->n_nodes && p.n < MK_SEQ_MAX_NODES; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if ((t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            break;
+        }
+        if ((t->op == GGML_OP_ADD || t->op == GGML_OP_MUL) && j + 1 < cgraph->n_nodes) {
+            const ggml_tensor * u = cgraph->nodes[j + 1];
+            const ggml_op ops[2] = { t->op, t->op };
+            if (u->op == t->op && u->src[0] == t && ggml_can_fuse(cgraph, j, ops, 2) &&
+                    ggml_are_same_layout(t->src[1], u->src[1])) {
+                break;
+            }
+        }
+        if (!ggml_cuda_mk_seq_node_supported(t, p.nodes[p.n])) {
+            break;
+        }
+        const range w = rng(t);
+        bool sync = hits(rd, w) || hits(wr, w) || t->op == GGML_OP_CUMSUM;
+        for (int k = 0; k < GGML_MAX_SRC && t->src[k] && !sync; ++k) {
+            sync = hits(wr, rng(t->src[k]));
+        }
+        if (sync) {
+            rd.clear();
+            wr.clear();
+        }
+        p.nodes[p.n].sync = sync;
+        wr.push_back(w);
+        for (int k = 0; k < GGML_MAX_SRC && t->src[k]; ++k) {
+            rd.push_back(rng(t->src[k]));
+        }
+        ++p.n;
+        last = j;
+    }
+    return p.n >= ggml_cuda_mk_seq_min_nodes() ? last : 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4299,6 +4356,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int last = ggml_cuda_match_mk_gdn(cgraph, i, m);
         if (last > 0) {
             ggml_cuda_mk_gdn_run(*cuda_ctx, m);
+            return last - i;
+        }
+    }
+
+    // [ignite] a run of small nodes (the QSA mask build) through the in-order executor, one launch
+    if (cuda_ctx->mk_buf != nullptr && cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty() &&
+            ggml_cuda_mk_seq_enabled()) {
+        mk_seq_params p;
+        const int last = ggml_cuda_match_mk_seq(cgraph, i, p);
+        if (last > 0) {
+            ggml_cuda_mk_seq_run(*cuda_ctx, p);
             return last - i;
         }
     }
