@@ -1445,6 +1445,15 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// [ignite] GGML_CUDA_Q8_1_CACHE=0 disables the MMVQ src1 q8_1 cache
+static bool ggml_cuda_q8_1_cache_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_Q8_1_CACHE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1454,6 +1463,36 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
+
+    // [ignite] q8_1 copies of recent MMVQ src1 tensors, so later MMVQ on the same src1 skip the quantize.
+    // Valid for one graph evaluation; a slot is dropped when a node writes into its src1.
+    struct q8_1_cache_slot {
+        const void * src = nullptr;
+        int64_t      ne[GGML_MAX_DIMS] = {};
+        size_t       nb[GGML_MAX_DIMS] = {};
+        size_t       nbytes = 0;
+        uint64_t     last_use = 0;
+    };
+    static constexpr int    Q8_1_CACHE_SLOTS     = 4;
+    static constexpr size_t Q8_1_CACHE_SLOT_SIZE = 64*1024;
+    q8_1_cache_slot q8_1_cache[Q8_1_CACHE_SLOTS];
+    char *          q8_1_cache_buf  = nullptr;
+    uint64_t        q8_1_cache_tick = 0;
+
+    void q8_1_cache_clear() {
+        for (q8_1_cache_slot & s : q8_1_cache) {
+            s.src = nullptr;
+        }
+    }
+
+    // drop slots whose src1 overlaps [data, data + size)
+    void q8_1_cache_invalidate(const void * data, size_t size) {
+        for (q8_1_cache_slot & s : q8_1_cache) {
+            if (s.src != nullptr && (const char *) data < (const char *) s.src + s.nbytes && (const char *) s.src < (const char *) data + size) {
+                s.src = nullptr;
+            }
+        }
+    }
 
     int curr_stream_no = 0;
 

@@ -757,6 +757,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             }
         }
     }
+    if (q8_1_cache_buf != nullptr) {
+        CUDA_CHECK(cudaFree(q8_1_cache_buf));
+    }
 }
 
 
@@ -4861,7 +4864,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ignite_prof_mark(cuda_ctx);
                 }
 
+                cuda_ctx->q8_1_cache_invalidate(node->data, ggml_nbytes(node));
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                // fused groups start with their MMVQ, so the later writes of a group can be dropped after the group ran
+                for (int j = i + 1; j <= i + nodes_to_skip; ++j) {
+                    cuda_ctx->q8_1_cache_invalidate(cgraph->nodes[j]->data, ggml_nbytes(cgraph->nodes[j]));
+                }
 
                 if (prof && nodes_to_skip != 0) {
                     ignite_prof_mark(cuda_ctx);
@@ -5013,6 +5022,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    // [ignite] the q8_1 cache buffer must exist before any capture starts
+    if (ggml_cuda_q8_1_cache_enabled()) {
+        if (cuda_ctx->q8_1_cache_buf == nullptr) {
+            CUDA_CHECK(ggml_cuda_device_malloc((void **) &cuda_ctx->q8_1_cache_buf,
+                ggml_backend_cuda_context::Q8_1_CACHE_SLOTS*ggml_backend_cuda_context::Q8_1_CACHE_SLOT_SIZE, cuda_ctx->device));
+        }
+        cuda_ctx->q8_1_cache_clear();
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

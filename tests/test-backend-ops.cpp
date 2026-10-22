@@ -5488,6 +5488,49 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
 }
 
 // GGML_OP_MUL_MAT_ID
+// [ignite] two MUL_MAT on the same src1 (backend may reuse its quantized copy), then an in-place write to src1 and a
+// third MUL_MAT that must see the new values
+struct test_mul_mat_shared_src1 : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_a, m, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_shared_src1(ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 256, int64_t k = 320)
+        : type_a(type_a), m(m), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w1 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * w2 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * w3 = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * a  = ggml_mul_mat(ctx, w1, x);
+        ggml_tensor * b  = ggml_mul_mat(ctx, w2, x);
+        ggml_tensor * x2 = ggml_scale_inplace(ctx, x, -2.0f);
+        ggml_tensor * c  = ggml_mul_mat(ctx, w3, x2);
+
+        ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, a, b), c);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -10752,6 +10795,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 2557, 1, 640,  {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0,   GGML_TYPE_F32, 640,  1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 288, 10, false, 2560, 1, 640));
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_mul_mat_shared_src1(t, 256, t == GGML_TYPE_Q6_K ? 2560 : 320));
+    }
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
