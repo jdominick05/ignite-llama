@@ -39,7 +39,9 @@ CPU contention cost 5-12% (decode is partly CPU/launch bound). Relative A/B resu
 | 2026-10-22 | + GDN segment megakernel (opt-in, same knob) | 53.58 / 53.71 | 41.37 / 41.38 | 18.6 | fn-bench-20261022-1* |
 | 2026-10-22 | megakernels default on (779d6576a) + DPP topk (04fd0b5fd) | 53.91 / 53.86 | 41.48 / 41.50 | 18.6 | fn-bench-20261022-1* |
 | 2026-10-22 | + shared expert first, FFN tail segment | 55.20 / 55.17 | 42.33 / 42.15 | 18.1 | fn-bench-20261022-1* |
-| 2026-10-22 | + shared gate/up via gate-fused MMVQ | **55.73 / 55.73** | **42.59 / 42.60** | 17.9 | fn-bench-20261022-1* |
+| 2026-10-22 | + shared gate/up via gate-fused MMVQ | 55.73 / 55.73 | 42.59 / 42.60 | 17.9 | fn-bench-20261022-1* |
+| 2026-10-22 | + megakernels write the q8_1 cache (2682bf4e2) | 56.31 / 56.58 | 42.98 / 43.16 | 17.7 | fn-bench-20261022-1* |
+| 2026-10-22 | + router + topk as one launch | **56.99 / 56.98** | **43.32 / 43.29** | 17.5 | fn-bench-20261022-1* |
 
 Expert matvecs (2026-10-22, negative, do not retry as-is): the `n_mats=288` perf cases run from Infinity Cache at
 the model's DRAM speed (IQ4_NL down 20.4 us vs 21.5 in the model), so they are bound by IQ3_XXS/IQ4_NL dequant
