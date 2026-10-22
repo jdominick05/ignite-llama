@@ -4554,18 +4554,59 @@ static ignite_prof_device & ignite_prof_dev(int device) {
     return devs[device];
 }
 
+// decode = every MoE expert mat-mul sees one token (plain mat-muls can be wider at decode, e.g. 4 hyper-connection
+// streams); graphs without MUL_MAT_ID fall back to plain mat-muls
 static int ignite_prof_class(const ggml_cgraph * cgraph) {
+    bool has_mmid = false;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[1]) {
+            has_mmid = true;
+            if (node->src[1]->ne[2] > 1) {
+                return 1;
+            }
+        }
+    }
+    if (has_mmid) {
+        return 0;
+    }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->ne[1] > 1) {
             return 1;
         }
-        if (node->op == GGML_OP_MUL_MAT_ID && node->src[1] && node->src[1]->ne[2] > 1) {
-            return 1;
-        }
     }
     return 0;
 }
+
+// IGNITE_PROF_MODE=ops (default): an event pair per node; =span: only the first and last event, so event packets
+// cannot change the timing. Either way a gate kernel holds the stream until the whole graph is queued, so the GPU
+// runs it back to back and the events measure GPU time, not the CPU's launch rate (HIP only; times out after ~0.5 s).
+static bool ignite_prof_per_op() {
+    static const bool per_op = !(getenv("IGNITE_PROF_MODE") && strcmp(getenv("IGNITE_PROF_MODE"), "span") == 0);
+    return per_op;
+}
+
+#if defined(GGML_USE_HIP)
+static __global__ void ignite_prof_gate_kernel(volatile int * flag) {
+    if (threadIdx.x == 0) {
+        const uint64_t t0 = wall_clock64();
+        while (*flag == 0 && wall_clock64() - t0 < 50000000ull) {   // wall clock is 100 MHz on gfx11: 0.5 s
+            __builtin_amdgcn_s_sleep(2);
+        }
+    }
+}
+
+static volatile int * ignite_prof_gate_flag(int device) {
+    static volatile int * flags[GGML_CUDA_MAX_DEVICES] = {};
+    if (!flags[device]) {
+        void * p = nullptr;
+        CUDA_CHECK(hipHostMalloc(&p, sizeof(int), hipHostMallocMapped | hipHostMallocCoherent));
+        flags[device] = (volatile int *) p;
+    }
+    return flags[device];
+}
+#endif // defined(GGML_USE_HIP)
 
 static std::string ignite_prof_label(const ggml_cgraph * cgraph, int i, int n_fused) {
     const ggml_tensor * node = cgraph->nodes[i];
@@ -4579,12 +4620,25 @@ static std::string ignite_prof_label(const ggml_cgraph * cgraph, int i, int n_fu
     return label;
 }
 
+static void ignite_prof_mark(ggml_backend_cuda_context * cuda_ctx);
+
 static void ignite_prof_begin(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
     ignite_prof_device & d = ignite_prof_dev(cuda_ctx->device);
     d.t_start_us = ggml_time_us();
     d.cls        = ignite_prof_class(cgraph);
     d.n_used     = 0;
     d.labels.clear();
+#if defined(GGML_USE_HIP)
+    volatile int * flag = ignite_prof_gate_flag(cuda_ctx->device);
+    *flag = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    void * dflag = nullptr;
+    CUDA_CHECK(hipHostGetDevicePointer(&dflag, (void *) flag, 0));
+    ignite_prof_gate_kernel<<<1, 32, 0, cuda_ctx->stream()>>>((volatile int *) dflag);
+#endif // defined(GGML_USE_HIP)
+    if (!ignite_prof_per_op()) {
+        ignite_prof_mark(cuda_ctx);   // span mode: the first of two events
+    }
 }
 
 static void ignite_prof_mark(ggml_backend_cuda_context * cuda_ctx) {
@@ -4599,6 +4653,14 @@ static void ignite_prof_mark(ggml_backend_cuda_context * cuda_ctx) {
 
 static void ignite_prof_end(ggml_backend_cuda_context * cuda_ctx) {
     ignite_prof_device & d = ignite_prof_dev(cuda_ctx->device);
+    if (!ignite_prof_per_op()) {
+        ignite_prof_mark(cuda_ctx);   // span mode: the second event
+    }
+#if defined(GGML_USE_HIP)
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    *ignite_prof_gate_flag(cuda_ctx->device) = 1;   // whole graph queued: open the gate
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif // defined(GGML_USE_HIP)
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
     const int c = d.cls;
     d.graphs[c]++;
@@ -4642,7 +4704,7 @@ static void ignite_prof_end(ggml_backend_cuda_context * cuda_ctx) {
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
-    const bool prof = ignite_prof_path() != nullptr;
+    const bool prof = ignite_prof_path() != nullptr && ignite_prof_per_op();   // per-node events (IGNITE_PROF_MODE=ops)
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
