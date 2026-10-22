@@ -53,6 +53,32 @@ fusion-wip + small-K, `rocprof-fuse-smallk-d0-20261022-0048` (median per-call ti
 kernels ~15.7 ms (mmvq ~10.3, other ~5.4), gaps ~10 ms. Top: Q6_K mmvq 3.28 ms (133 calls), Q8_0 mmvq 2.99 ms
 (508 calls), IQ3_XXS gate+up 1.50 ms, IQ4_NL down 1.21 ms, quantize_q8_1 1.15 ms (737 calls).
 
+## Megakernel Stage 0 (2026-10-22)
+
+Barrier vs launch (`ignite/perf/mk-barrier.cpp`, generation-counter grid barrier, 256-thread blocks; RDNA3 reports
+WGPs: XTX 48, XT 42):
+
+| | XTX | XT |
+|---|---|---|
+| launch in a HIP graph (tiny kernel) | 2.65 us | 2.93 us |
+| persistent kernel launch in a graph, any grid size | 2.7 us | 3.0 us |
+| barrier, 1-4 blocks per WGP | **0.36-0.41 us** | **0.45-0.51 us** |
+| barrier, 8 blocks per WGP (full occupancy) | 0.94 us | 0.85 us |
+
+Gate (< 1.5 us) passed: global barriers, grid 2-4 blocks per WGP. A spin-barrier kernel captures into a HIP graph
+and replays correctly (40 replays, no timeout).
+
+KLD perturbation floor (known-correct 1-ulp variants vs the ub-1 / ub-256 bases, `kld-floor-20261022-0738.txt`):
+
+| variant | ub 1 KLD / same top / PPL ratio | ub 256 KLD / same top / PPL ratio |
+|---|---|---|
+| A: FMA contraction in the shared-expert gate | 0.0165 / 97.2% / 0.994 +- 0.005 | 0.026 / 94.7% / 1.003 +- 0.003 |
+| C: hc rms_norm scalar instead of vector path | 0.0165 / 97.2% / 0.993 +- 0.004 | 0.029 / 94.7% / 1.007 +- 0.003 |
+
+(Variant B, the 512-thread vector rms_norm, is not a floor point: that path cannot hold 2,560 columns and gave NaN.)
+**Megakernel gate (re-based, user decision):** ub 1 KLD <= 0.02, same top >= 96.5%, PPL ratio within 1 +- 0.01;
+ub 256 KLD <= 0.032, same top >= 94%.
+
 ## Tensor parallel sync cost (Phase 3, 2026-10-22, a1fd75058, `-sm tensor`, internal allreduce)
 
 No RCCL in this build: the Linux default (NCCL) falls back to the internal host-staged allreduce (same speed as
