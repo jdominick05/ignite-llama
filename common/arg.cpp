@@ -4323,6 +4323,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-ngram-mod-n-start"}, "N",
+        string_format("ngram-mod adaptive draft length: drafts start at N tokens, double after a fully accepted draft "
+                      "up to --spec-ngram-mod-n-max, and go back to N after a miss (default: %d, 0 = off)",
+                      params.speculative.ngram_mod.n_start),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("ngram n-start must be between 0 and 1024 inclusive");
+            }
+            params.speculative.ngram_mod.n_start = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-ngram-mod-n-match"}, "N",
         string_format("ngram-mod lookup length (default: %d)", params.speculative.ngram_mod.n_match),
         [](common_params & params, int value) {

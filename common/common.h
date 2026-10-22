@@ -362,6 +362,8 @@ struct common_params_speculative_ngram_mod {
 
     int32_t n_max = 64;
     int32_t n_min = 48;
+
+    int32_t n_start = 0; // [ignite] adaptive length: start at n_start, double after a fully accepted draft (0 = off)
 };
 
 struct common_params_speculative_ngram_suffix {

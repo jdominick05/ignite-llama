@@ -1992,6 +1992,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
+
+        // [ignite] current draft length limit with --spec-ngram-mod-n-start (0 = not started)
+        int n_cur = 0;
     };
 
     std::vector<seq_info> sinfos;
@@ -2073,16 +2076,20 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             sinfo.i_last = cur_len - n;
         }
 
-        result.resize(n + params.n_max);
+        // [ignite] adaptive length: the current limit, and the minimum capped to it
+        const int n_lim = params.n_start > 0 ? std::min(params.n_max, sinfo.n_cur > 0 ? sinfo.n_cur : params.n_start) : params.n_max;
+        const int n_lo  = std::min(params.n_min, n_lim);
+
+        result.resize(n + n_lim);
         for (size_t i = 0; i < n - 1; ++i) {
             result[i] = prompt.at(cur_len - n + 1 + i);
         }
         result[n - 1] = dparams.id_last;
 
-        for (int i = 0; i < params.n_max; ++i) {
+        for (int i = 0; i < n_lim; ++i) {
             const llama_token token = mod.get(result.data() + i);
             if (token == common_ngram_mod::EMPTY) {
-                if (i < params.n_min) {
+                if (i < n_lo) {
                     result.clear();
                     return;
                 }
@@ -2127,6 +2134,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
 
         auto & sinfo = sinfos[seq_id];
+
+        // [ignite] adaptive length: grow after a fully accepted draft, back to the start after a miss
+        if (params.n_start > 0 && sinfo.n_draft_last > 0) {
+            const int n_cur = sinfo.n_cur > 0 ? sinfo.n_cur : params.n_start;
+            sinfo.n_cur = n_accepted >= sinfo.n_draft_last ? std::min(params.n_max, 2*n_cur) : params.n_start;
+        }
 
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {
