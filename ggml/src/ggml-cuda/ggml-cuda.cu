@@ -62,6 +62,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/megakernel.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -759,6 +760,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
     if (q8_1_cache_buf != nullptr) {
         CUDA_CHECK(cudaFree(q8_1_cache_buf));
+    }
+    if (mk_buf != nullptr) {
+        ggml_cuda_megakernel_report(*this);
+        CUDA_CHECK(cudaFree(mk_buf));
     }
 }
 
@@ -3731,6 +3736,144 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// [ignite] the qwen4exp hc mixer at node i (build_hc_mix): RMS_NORM, MUL, MUL_MAT down, [MUL_MAT inject], SCALE, SILU,
+// MUL_MAT up, DSV4_HC_PRE (gated), views in between. Returns the index of the last node, 0 if no match.
+static int ggml_cuda_match_mk_hc_mix(const ggml_cgraph * cgraph, int i, ggml_cuda_mk_hc_mix & m) {
+    int idx[8];
+    int n = 0;
+    for (int j = i; j < cgraph->n_nodes && n < 8; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if ((t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return 0;
+        }
+        idx[n++] = j;
+    }
+    if (n < 7) {
+        return 0;
+    }
+    const auto node = [&](int k) { return cgraph->nodes[idx[k]]; };
+    const auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+
+    ggml_tensor * norm = node(0);
+    ggml_tensor * mul  = node(1);
+    if (norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || mul->src[0] != norm || norm->src[0]->ne[2] != 1 ||
+            !ggml_node_has_n_uses(cgraph, idx[0], 1) || (norm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    ggml_tensor * down = node(2);
+    if (down->op != GGML_OP_MUL_MAT || root(down->src[1]) != mul || down->src[1]->ne[1] != 1 ||
+            !ggml_is_contiguous(down->src[1])) {
+        return 0;
+    }
+    ggml_tensor * inject = nullptr;
+    int k = 3;
+    if (node(3)->op == GGML_OP_MUL_MAT && node(3)->src[1] == down->src[1]) {
+        inject = node(3);
+        if (inject->src[0]->ne[1] > down->src[0]->ne[1]) {
+            std::swap(down, inject);
+        }
+        k = 4;
+    }
+    if (k + 3 >= n) {
+        return 0;
+    }
+    ggml_tensor * scale = node(k);
+    ggml_tensor * silu  = node(k + 1);
+    ggml_tensor * up    = node(k + 2);
+    ggml_tensor * pre   = node(k + 3);
+    if (scale->op != GGML_OP_SCALE || scale->src[0] != down || !ggml_node_has_n_uses(cgraph, idx[k], 1) ||
+            (scale->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    if (silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != scale) {
+        return 0;
+    }
+    if (up->op != GGML_OP_MUL_MAT || up->src[1] != silu) {
+        return 0;
+    }
+    if (pre->op != GGML_OP_DSV4_HC_PRE || ggml_get_op_params_i32(pre, 1) == 0 || root(pre->src[0]) != mul ||
+            root(pre->src[1]) != up || !ggml_are_same_shape(pre->src[0], norm->src[0]) ||
+            !ggml_are_same_shape(pre->src[1], norm->src[0]) || !ggml_is_contiguous(pre->src[0]) ||
+            !ggml_is_contiguous(pre->src[1])) {
+        return 0;
+    }
+    for (const ggml_tensor * mm : { down, inject, up }) {
+        if (mm && !ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
+            return 0;
+        }
+    }
+
+    m.x         = norm->src[0];
+    m.w_norm    = mul->src[1];
+    m.eps       = ggml_get_op_params_f32(norm, 0);
+    m.xn        = mul;
+    m.w_down    = down->src[0];
+    m.lo        = down;
+    m.w_inject  = inject ? inject->src[0] : nullptr;
+    m.inject    = inject;
+    m.s         = ggml_get_op_params_f32(scale, 0);
+    m.b         = ggml_get_op_params_f32(scale, 1);
+    m.act       = silu;
+    m.w_up      = up->src[0];
+    m.gate      = up;
+    m.pre_scale = ggml_get_op_params_f32(pre, 0);
+    m.mixed     = pre;
+    if (!ggml_cuda_mk_hc_mix_supported(m)) {
+        return 0;
+    }
+
+    // xn, lo, act and gate are not written (megakernel scratch), so no node after the segment may read them
+    const int last = idx[k + 3];
+    const ggml_tensor * internal[] = { mul, down, scale, silu, up };
+    for (const ggml_tensor * t : internal) {
+        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+    }
+    for (int j = last + 1; j < cgraph->n_nodes; ++j) {
+        for (const ggml_tensor * src : cgraph->nodes[j]->src) {
+            if (!src) {
+                continue;
+            }
+            const ggml_tensor * r = root(src);
+            for (const ggml_tensor * t : internal) {
+                if (r == t) {
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // the stages overlap across blocks, so the written outputs may not share memory with each other or the inputs
+    const ggml_tensor * outs[] = { m.inject, m.mixed };
+    const ggml_tensor * ins[]  = { m.x, m.w_norm, m.w_down, m.w_inject, m.w_up };
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    for (size_t a = 0; a < sizeof(outs)/sizeof(outs[0]); ++a) {
+        if (!outs[a]) {
+            continue;
+        }
+        for (size_t b = a + 1; b < sizeof(outs)/sizeof(outs[0]); ++b) {
+            if (outs[b] && overlap(outs[a], outs[b])) {
+                return 0;
+            }
+        }
+        for (const ggml_tensor * in : ins) {
+            if (in && overlap(outs[a], in)) {
+                return 0;
+            }
+        }
+    }
+    return last;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -3738,6 +3881,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // [ignite] hc mixer as one megakernel launch
+    if (node->op == GGML_OP_RMS_NORM && cuda_ctx->mk_buf != nullptr && cuda_ctx->curr_stream_no == 0 &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        ggml_cuda_mk_hc_mix m;
+        const int last = ggml_cuda_match_mk_hc_mix(cgraph, i, m);
+        if (last > 0) {
+            ggml_cuda_mk_hc_mix_run(*cuda_ctx, m);
+            return last - i;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -5071,6 +5225,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
         cuda_ctx->q8_1_cache_clear();
     }
+    // [ignite] megakernel scratch, also before any capture
+    ggml_cuda_megakernel_prepare(*cuda_ctx);
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

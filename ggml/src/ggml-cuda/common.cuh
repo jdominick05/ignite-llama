@@ -1479,6 +1479,10 @@ struct ggml_backend_cuda_context {
     char *          q8_1_cache_buf  = nullptr;
     uint64_t        q8_1_cache_tick = 0;
 
+    // [ignite] megakernel scratch (megakernel.cu) and the grid size every megakernel on this device launches with
+    char * mk_buf  = nullptr;
+    int    mk_grid = 0;
+
     void q8_1_cache_clear() {
         for (q8_1_cache_slot & s : q8_1_cache) {
             s.src = nullptr;

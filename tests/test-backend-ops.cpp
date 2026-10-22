@@ -5525,6 +5525,63 @@ struct test_mul_mat_pair : public test_case {
     }
 };
 
+// [ignite] the qwen4exp hc mixer (build_hc_mix), which the CUDA backend runs as one megakernel launch:
+// rms_norm*w -> down (+ inject) -> silu(scale) -> up -> gated hc_pre
+struct test_hc_mix : public test_case {
+    const int64_t ncols, hc, nlo, ninject;
+    const bool    norm_w_rows;
+
+    std::string vars() override {
+        return VARS_TO_STR5(ncols, hc, nlo, ninject, norm_w_rows);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_MIX";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_hc_mix(int64_t ncols = 2560, int64_t hc = 4, int64_t nlo = 320, int64_t ninject = 4, bool norm_w_rows = true)
+        : ncols(ncols), hc(hc), nlo(nlo), ninject(ninject), norm_w_rows(norm_w_rows) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, hc);
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, norm_w_rows ? hc : 1);
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, ncols*hc, nlo);
+        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, nlo, ncols*hc);
+
+        ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w_norm);
+        xn = ggml_reshape_2d(ctx, xn, ncols*hc, 1);
+
+        ggml_tensor * lo     = ggml_mul_mat(ctx, w_down, xn);
+        ggml_tensor * inject = nullptr;
+        if (ninject > 0) {
+            ggml_tensor * w_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, ncols*hc, ninject);
+            inject = ggml_mul_mat(ctx, w_inject, xn);
+            if (mode == MODE_TEST) {
+                // model order: down and inject next to each other
+                ggml_build_forward_expand(gf, lo);
+                ggml_build_forward_expand(gf, inject);
+            }
+        }
+        lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc));
+        ggml_tensor * gate  = ggml_mul_mat(ctx, w_up, lo);
+        ggml_tensor * mixed = ggml_dsv4_hc_pre_gated(ctx,
+                ggml_reshape_3d(ctx, xn,   ncols, hc, 1),
+                ggml_reshape_3d(ctx, gate, ncols, hc, 1), 1.0f / (float) hc);
+
+        // inject is a K = ncols*hc dot product, ~100x mixed: scale it so neither part hides the other in the NMSE
+        ggml_tensor * out = inject ? ggml_concat(ctx, mixed, ggml_scale(ctx, inject, 0.01f), 0) : mixed;
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // [ignite] a + x*sigmoid(g), one gate value per row (qwen4exp shared expert); swapped: add operands swapped
 struct test_sigmoid_mul_add : public test_case {
     const std::array<int64_t, 2> ne;
@@ -10870,6 +10927,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_pair(GGML_TYPE_Q6_K, 10240, 6144, 2560));
     test_cases.emplace_back(new test_mul_mat_pair(GGML_TYPE_Q8_0, 48, 48, 2560));
     test_cases.emplace_back(new test_mul_mat_pair(GGML_TYPE_IQ4_NL, 640, 33, 2560));
+    test_cases.emplace_back(new test_hc_mix());
+    test_cases.emplace_back(new test_hc_mix(2560, 4, 320, 0));
+    test_cases.emplace_back(new test_hc_mix(2560, 4, 320, 4, false));
+    test_cases.emplace_back(new test_hc_mix(4096, 4, 512, 8));
     for (bool sw : {false, true}) {
         test_cases.emplace_back(new test_sigmoid_mul_add({2560, 1}, sw));
         test_cases.emplace_back(new test_sigmoid_mul_add({64, 5}, sw));
