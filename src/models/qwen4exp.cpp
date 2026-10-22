@@ -633,13 +633,15 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
-    qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
-    cb(qkv_mixed, "linear_attn_qkv_mixed", il);
-
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
-    // z is only consumed by the gated norm after the delta net: expand it here so its matvec runs next to qkv
+    // z is only consumed by the gated norm after the delta net: expand it next to qkv (before qkv's reshape), so its
+    // matvec runs right after qkv and the CUDA backend can run both in one launch
+    ggml_build_forward_expand(gf, qkv_mixed);
     ggml_build_forward_expand(gf, z);
+
+    qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
+    cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     return { qkv_mixed, z };
 }
