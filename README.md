@@ -1,3 +1,5 @@
+> **ignite-llama**: a fork of llama.cpp tuned for Qwen3.8 Flash-Next decode on AMD RDNA3 (ROCm/HIP), 58.7 tok/s on 7900 XTX + 7900 XT. See [`ignite/README.md`](ignite/README.md). Not affiliated with or endorsed by ggml-org; the rest of this README is upstream's.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
