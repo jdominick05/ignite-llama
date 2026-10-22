@@ -84,3 +84,27 @@ bool ggml_cuda_mk_gdn_enabled();
 bool ggml_cuda_mk_gdn_supported(const ggml_cuda_mk_gdn & m);
 
 void ggml_cuda_mk_gdn_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk_gdn & m);
+
+// qwen4exp FFN tail (decode, one token), the nodes after the routed and shared down matmuls:
+//   moe   = sum_k down[:, k]*w[k]                        (moe_weighted_reduction order)
+//   g     = sigmoid(w_sg . x)                            (mul_mat_vec_f<256> order, one row)
+//   out   = moe + shexp*g                                (sigmoid_mul_add)
+//   dst   = out*p[h] + residual[:, h],  p = s2*sigmoid(s1*inject + b1) + b2   (gated dsv4_hc_post, no comb)
+struct ggml_cuda_mk_ffn_tail {
+    const ggml_tensor * experts;  // [n_embd, n_used]
+    const ggml_tensor * weights;  // [1, n_used]
+    const ggml_tensor * shexp;    // [n_embd]
+    const ggml_tensor * w_sg;     // f32 [n_embd, 1]
+    const ggml_tensor * x;        // [n_embd]
+    const ggml_tensor * residual; // [n_embd, hc]
+    const ggml_tensor * inject;   // [hc]
+    float               s1, b1, s2, b2;
+    ggml_tensor *       dst;      // [n_embd, hc]
+};
+
+// GGML_CUDA_MEGAKERNEL_FFN=0 turns this segment off
+bool ggml_cuda_mk_ffn_tail_enabled();
+
+bool ggml_cuda_mk_ffn_tail_supported(const ggml_cuda_mk_ffn_tail & m);
+
+void ggml_cuda_mk_ffn_tail_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk_ffn_tail & m);

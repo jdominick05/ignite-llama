@@ -4058,6 +4058,127 @@ static int ggml_cuda_match_mk_gdn(const ggml_cgraph * cgraph, int i, ggml_cuda_m
     return last;
 }
 
+// [ignite] qwen4exp FFN tail: routed weighting (MUL + ADD chain), shared gate matvec, sigmoid, mul, add, gated hc_post;
+// returns the index of the last node, 0 when the nodes differ
+static int ggml_cuda_match_mk_ffn_tail(const ggml_cgraph * cgraph, int i, ggml_cuda_mk_ffn_tail & m) {
+    ggml_cuda_moe_weighted_reduction_match wr;
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, wr) || wr.expert_scale != nullptr || wr.dst->ne[2] != 1 ||
+            wr.dst->ne[3] != 1) {
+        return 0;
+    }
+    constexpr int N = 8;
+    int idx[N];
+    int n = 0;
+    for (int j = i + wr.node_count; j < cgraph->n_nodes && n < N; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if ((t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return 0;
+        }
+        idx[n++] = j;
+    }
+    if (n < N) {
+        return 0;
+    }
+    const auto node = [&](int k) { return cgraph->nodes[idx[k]]; };
+    const auto unary_is = [](const ggml_tensor * t, ggml_unary_op op) {
+        return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op;
+    };
+    const auto is_pair = [](const ggml_tensor * t, const ggml_tensor * a, const ggml_tensor * b) {
+        return (t->src[0] == a && t->src[1] == b) || (t->src[0] == b && t->src[1] == a);
+    };
+    ggml_tensor * mm   = node(0);
+    ggml_tensor * sig  = node(1);
+    ggml_tensor * mul  = node(2);
+    ggml_tensor * add  = node(3);
+    ggml_tensor * sc1  = node(4);
+    ggml_tensor * sig2 = node(5);
+    ggml_tensor * sc2  = node(6);
+    ggml_tensor * post = node(7);
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[0]->type != GGML_TYPE_F32 || mm->src[0]->ne[1] != 1 || mm->ne[1] != 1 ||
+            !unary_is(sig, GGML_UNARY_OP_SIGMOID) || sig->src[0] != mm || mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD) {
+        return 0;
+    }
+    const ggml_tensor * shexp = mul->src[0] == sig ? mul->src[1] : mul->src[0];
+    if (!is_pair(mul, shexp, sig) || !is_pair(add, wr.dst, mul) || ggml_nelements(shexp) != wr.dst->ne[0]) {
+        return 0;
+    }
+    if (sc1->op != GGML_OP_SCALE || !unary_is(sig2, GGML_UNARY_OP_SIGMOID) || sig2->src[0] != sc1 || sc2->op != GGML_OP_SCALE ||
+            sc2->src[0] != sig2 || post->op != GGML_OP_DSV4_HC_POST || post->src[0] != add || post->src[2] != sc2 ||
+            post->src[3] != nullptr || post->ne[2] != 1) {
+        return 0;
+    }
+
+    m.experts  = wr.experts;
+    m.weights  = wr.weights;
+    m.shexp    = shexp;
+    m.w_sg     = mm->src[0];
+    m.x        = mm->src[1];
+    m.residual = post->src[1];
+    m.inject   = sc1->src[0];
+    m.s1       = ggml_get_op_params_f32(sc1, 0);
+    m.b1       = ggml_get_op_params_f32(sc1, 1);
+    m.s2       = ggml_get_op_params_f32(sc2, 0);
+    m.b2       = ggml_get_op_params_f32(sc2, 1);
+    m.dst      = post;
+    if (!ggml_cuda_mk_ffn_tail_supported(m)) {
+        return 0;
+    }
+
+    // only dst is written
+    const int last = idx[N - 1];
+    const ggml_tensor * internal[] = { wr.dst, mm, sig, mul, add, sc1, sig2, sc2 };
+    for (const ggml_tensor * t : internal) {
+        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+    }
+    for (int j = i; j < last; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t != wr.dst && (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+    }
+    const auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+    for (int j = last + 1; j < cgraph->n_nodes; ++j) {
+        for (const ggml_tensor * src : cgraph->nodes[j]->src) {
+            if (!src) {
+                continue;
+            }
+            const ggml_tensor * r = root(src);
+            for (const ggml_tensor * t : internal) {
+                if (r == t) {
+                    return 0;
+                }
+            }
+            for (int k = i; k < i + wr.node_count; ++k) {
+                if (r == cgraph->nodes[k]) {
+                    return 0;
+                }
+            }
+        }
+    }
+    // a column's inputs are read before its outputs are written, by the same thread; other columns of the inputs
+    // must not share memory with dst
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    const ggml_tensor * ins[] = { m.experts, m.weights, m.shexp, m.w_sg, m.x, m.inject };
+    for (const ggml_tensor * in : ins) {
+        if (overlap(m.dst, in)) {
+            return 0;
+        }
+    }
+    if (overlap(m.dst, m.residual) && m.dst->data != m.residual->data) {
+        return 0;
+    }
+    return last;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4073,6 +4194,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int last = ggml_cuda_match_mk_hc_mix(cgraph, i, m);
         if (last > 0) {
             ggml_cuda_mk_hc_mix_run(*cuda_ctx, m);
+            return last - i;
+        }
+    }
+
+    // [ignite] FFN tail (routed weighting, shared gate, residual add, hc_post) as one launch
+    if (node->op == GGML_OP_MUL && cuda_ctx->mk_buf != nullptr && cuda_ctx->curr_stream_no == 0 &&
+            cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_mk_ffn_tail_enabled()) {
+        ggml_cuda_mk_ffn_tail m;
+        const int last = ggml_cuda_match_mk_ffn_tail(cgraph, i, m);
+        if (last > 0) {
+            ggml_cuda_mk_ffn_tail_run(*cuda_ctx, m);
             return last - i;
         }
     }

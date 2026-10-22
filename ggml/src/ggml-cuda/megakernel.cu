@@ -1149,3 +1149,145 @@ void ggml_cuda_mk_gdn_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk_gd
     mk_gdn_kernel<<<m.H*MK_GDN_QUARTERS, block_dims, 0, ctx.stream()>>>(p);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FFN tail: routed weighting, shared expert gate, residual combine, hc_post
+
+static constexpr int MK_TAIL_THREADS = 256; // mul_mat_vec_f block size for this row length, and columns per block
+static constexpr int MK_TAIL_MAX_USED = 16;
+static constexpr int MK_TAIL_MAX_HC   = 8;
+
+struct mk_ffn_tail_params {
+    const float * experts;
+    const float * weights;
+    const float * shexp;
+    const float * w_sg;
+    const float * x;
+    const float * residual;
+    const float * inject;
+    float         s1, b1, s2, b2;
+    float *       dst;
+    int64_t       n_embd;
+    int           n_used;
+    int           hc;
+};
+
+__launch_bounds__(MK_TAIL_THREADS, 1)
+static __global__ void mk_ffn_tail_kernel(const mk_ffn_tail_params p) {
+#ifdef MK_DEVICE_CODE
+    constexpr int warp_size = MK_WARP_SIZE;
+    const int tid = threadIdx.x;
+
+    // shared expert gate: mul_mat_vec_f<float, float, 1, 256>, recomputed by every block
+    __shared__ float buf_iw[warp_size];
+    __shared__ float s_gate;
+    if (tid < warp_size) {
+        buf_iw[tid] = 0.0f;
+    }
+    __syncthreads();
+    {
+        const float2 * x2 = (const float2 *) p.w_sg;
+        const float2 * y2 = (const float2 *) p.x;
+        float sumf = 0.0f;
+        for (int col2 = tid; col2 < p.n_embd/2; col2 += MK_TAIL_THREADS) {
+            const float2 tmpx = x2[col2];
+            const float2 tmpy = y2[col2];
+            ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+            ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+        }
+        sumf = warp_reduce_sum<warp_size>(sumf);
+        buf_iw[tid/warp_size] = sumf;
+        __syncthreads();
+        if (tid < warp_size) {
+            sumf = buf_iw[tid];
+            sumf = warp_reduce_sum<warp_size>(sumf);
+            if (tid == 0) {
+                s_gate = sumf;
+            }
+        }
+        __syncthreads();
+    }
+
+    const int64_t col = (int64_t) blockIdx.x*MK_TAIL_THREADS + tid;
+    if (col >= p.n_embd) {
+        return;
+    }
+
+    // moe_weighted_reduction_f32 (no expert scale)
+    const float first_scale = 1.0f;
+    float moe = (p.experts[col] * first_scale) * p.weights[0];
+    for (int e = 1; e < p.n_used; ++e) {
+        const float scale = 1.0f;
+        moe += (p.experts[e*p.n_embd + col] * scale) * p.weights[e];
+    }
+
+    // sigmoid_mul_add_kernel
+    float out;
+    {
+#pragma clang fp contract(off)
+        const float m = p.shexp[col]*mk_sigmoid(s_gate);
+        out = moe + m;
+    }
+
+    // dsv4_hc_post_f32<false, true>
+    for (int h = 0; h < p.hc; ++h) {
+        float pp = p.inject[h];
+        pp = p.s2 / (1.0f + expf(-(p.s1*pp + p.b1))) + p.b2;
+        float sum = out * pp;
+        sum += p.residual[h*p.n_embd + col];
+        p.dst[h*p.n_embd + col] = sum;
+    }
+#else
+    GGML_UNUSED(p);
+    NO_DEVICE_CODE;
+#endif // MK_DEVICE_CODE
+}
+
+bool ggml_cuda_mk_ffn_tail_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MEGAKERNEL_FFN");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+bool ggml_cuda_mk_ffn_tail_supported(const ggml_cuda_mk_ffn_tail & m) {
+    const int64_t n_embd = m.shexp->ne[0];
+    const int64_t n_used = m.experts->ne[1];
+    const int64_t hc     = m.residual->ne[1];
+    const auto f32c = [](const ggml_tensor * t, int64_t n) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == n;
+    };
+    if (n_used < 2 || n_used > MK_TAIL_MAX_USED || hc < 1 || hc > MK_TAIL_MAX_HC || n_embd % 2 != 0 ||
+            n_embd > 64*MK_TAIL_THREADS) {
+        return false;
+    }
+    if (!f32c(m.experts, n_embd*n_used) || m.experts->ne[0] != n_embd || !f32c(m.weights, n_used) ||
+            !f32c(m.shexp, n_embd) || !f32c(m.w_sg, n_embd) || !f32c(m.x, n_embd) || !f32c(m.residual, n_embd*hc) ||
+            m.residual->ne[0] != n_embd || !f32c(m.inject, hc) || !f32c(m.dst, n_embd*hc)) {
+        return false;
+    }
+    return ((uintptr_t) m.w_sg->data | (uintptr_t) m.x->data) % 8 == 0;
+}
+
+void ggml_cuda_mk_ffn_tail_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk_ffn_tail & m) {
+    mk_ffn_tail_params p;
+    p.experts  = (const float *) m.experts->data;
+    p.weights  = (const float *) m.weights->data;
+    p.shexp    = (const float *) m.shexp->data;
+    p.w_sg     = (const float *) m.w_sg->data;
+    p.x        = (const float *) m.x->data;
+    p.residual = (const float *) m.residual->data;
+    p.inject   = (const float *) m.inject->data;
+    p.s1       = m.s1;
+    p.b1       = m.b1;
+    p.s2       = m.s2;
+    p.b2       = m.b2;
+    p.dst      = (float *) m.dst->data;
+    p.n_embd   = m.shexp->ne[0];
+    p.n_used   = (int) m.experts->ne[1];
+    p.hc       = (int) m.residual->ne[1];
+    const int nblocks = (int) ((p.n_embd + MK_TAIL_THREADS - 1) / MK_TAIL_THREADS);
+    mk_ffn_tail_kernel<<<nblocks, MK_TAIL_THREADS, 0, ctx.stream()>>>(p);
+    CUDA_CHECK(cudaGetLastError());
+}
