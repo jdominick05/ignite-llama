@@ -53,6 +53,22 @@ fusion-wip + small-K, `rocprof-fuse-smallk-d0-20261022-0048` (median per-call ti
 kernels ~15.7 ms (mmvq ~10.3, other ~5.4), gaps ~10 ms. Top: Q6_K mmvq 3.28 ms (133 calls), Q8_0 mmvq 2.99 ms
 (508 calls), IQ3_XXS gate+up 1.50 ms, IQ4_NL down 1.21 ms, quantize_q8_1 1.15 ms (737 calls).
 
+## Tensor parallel sync cost (Phase 3, 2026-10-22, a1fd75058, `-sm tensor`, internal allreduce)
+
+No RCCL in this build: the Linux default (NCCL) falls back to the internal host-staged allreduce (same speed as
+`GGML_CUDA_ALLREDUCE=internal`; the meta butterfly `none` is slower, 44.6). tg128 d0: tensor 45.67 vs layer 46.83.
+Split ratio barely matters: 500/500 44.78, 530/470 45.65, 560/440 45.72, 590/410 45.83.
+
+XTX trace (`rocprof-20261022-050305`, 24 tokens): 96 allreduces/token (2 per layer, ~10 KB each), duration
+min 6.2 / p5 6.8 / p10 22.0 / median 34.9 / p90 48.6 us, 3.36 ms/token in total.
+- **The link itself is cheap: ~6.5 us per allreduce = ~0.6 ms/token** (the fast tail, both cards arriving together).
+- The other ~2.7 ms is the XTX waiting for the XT.
+- What blocks tensor mode is per-card work, not sync: each card runs all ~3,020 kernels (layer split: ~1,600 /
+  ~1,300), so launch overhead per card doubles; non-matmul work (5.1 ms on the XTX) is replicated; and matvec only
+  falls to 6.4 ms on the XTX (mirrored tensors: shared expert, hc_*, router are read in full on both cards).
+- So tensor parallel pays only after the kernel count drops (megakernel / fusion). It compounds with that work:
+  the sync floor is ~3% of today's token.
+
 ## Delivered decode with drafting (Phase 6, 2026-10-22, 85865ffa2, `fn-spec.sh`, serve_bench: 3 synthetic + 8 real agent requests 8k-20k prompt, temp 1.0 seed 42)
 
 | config | code / prose | rewrite (copy-heavy) | 8 real agent requests | all |
