@@ -17,6 +17,10 @@ static_assert(calc_nwarps(GGML_TYPE_Q8_0, 1, MMVQ_PARAMETERS_RDNA3_0, true)  == 
 static_assert(calc_rows_per_block(GGML_TYPE_Q8_0, 1, MMVQ_PARAMETERS_RDNA3_0, false, MK_NWARPS) == 1, "hc down rows per block");
 
 static constexpr int MK_UP_ROWS = calc_rows_per_block(GGML_TYPE_Q8_0, 1, MMVQ_PARAMETERS_RDNA3_0, true, MK_NWARPS);
+// stage 3 (up matvec): rows per warp and per task
+static constexpr int MK_UP_WARP_ROWS = 4;
+static constexpr int MK_UP_TASK_ROWS = MK_NWARPS*MK_UP_WARP_ROWS;
+static_assert(MK_UP_ROWS == MK_NWARPS && MK_NWARPS > 1, "stage 3 sums in the order of the small-K kernel with nwarps rows");
 
 // limits of the scratch layout below
 static constexpr int MK_MAX_NCOLS4  = 1024;  // rms_norm_f32<1024> vec path: one float4 per thread
@@ -204,24 +208,39 @@ static __global__ void mk_hc_mix_kernel(const mk_hc_mix_params p) {
     }
 
     __shared__ float  s_part[MK_WARP_SIZE];
-    __shared__ float4 s_row[MK_MAX_NCOLS4];
 
     const uint32_t K      = p.ncols*p.hc;
     const int      ncols4 = p.ncols/4;
     const int      nb_row = p.ncols/QK8_1;
 
-    // stage 1, a task per stream: rms_norm_f32<1024, do_multiply, vec> owns one float4 per thread. Warp w runs that
-    // kernel's warps w, w+8, w+16, w+24, so every partial sum and the final reduce happen in the same order.
-    mk_tasks(p, 0, p.hc, 1, [&](uint32_t r) {
-        const float4 * x4 = (const float4 *) (p.x + (int64_t) r*p.ncols);
-        const float4 * m4 = (const float4 *) (p.w_norm + r*p.w_norm_row);
+    // stage 1, a task per (stream, MK_NWARPS q8_1 blocks of it): rms_norm_f32<1024, do_multiply, vec> owns one float4
+    // per thread. Every task recomputes its stream's sum of squares (the row is 10 KB from L2) with warp w running that
+    // kernel's warps w, w+8, w+16, w+24, so every partial sum and the final reduce happen in the same order; then warp w
+    // scales and quantizes one q8_1 block. (scale*x)*w per element is what the float4 path computes.
+    const uint32_t tasks_per_row = (nb_row + MK_NWARPS - 1)/MK_NWARPS;
+    mk_tasks(p, 0, p.hc*tasks_per_row, 1, [&](uint32_t t) {
+        const uint32_t r  = t / tasks_per_row;
+        const int      ib = MK_NWARPS*(t % tasks_per_row) + warp;
+        const float  * xr = p.x + (int64_t) r*p.ncols;
+        const float4 * x4 = (const float4 *) xr;
+
+        // all loads first, so they are in flight together
         float4 xs[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = MK_WARP_SIZE*(warp + MK_NWARPS*j) + lane;
+            if (i < ncols4) {
+                xs[j] = x4[i];
+            }
+        }
+        const int   ie = QK8_1*ib + lane;
+        const float xe = ib < nb_row ? xr[ie] : 0.0f;
+        const float me = ib < nb_row ? p.w_norm[r*p.w_norm_row + ie] : 0.0f;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int i = MK_WARP_SIZE*(warp + MK_NWARPS*j) + lane;
             float tmp = 0.0f;
             if (i < ncols4) {
-                xs[j] = x4[i];
                 tmp += xs[j].x*xs[j].x + xs[j].y*xs[j].y + xs[j].z*xs[j].z + xs[j].w*xs[j].w;
             }
             tmp = warp_reduce_sum<MK_WARP_SIZE>(tmp);
@@ -233,29 +252,15 @@ static __global__ void mk_hc_mix_kernel(const mk_hc_mix_params p) {
         const float tmp   = warp_reduce_sum<MK_WARP_SIZE>(s_part[lane]);
         const float scale = rsqrtf(tmp / p.ncols + p.eps);
 
-        float4 * xn4 = (float4 *) (p.xn + (int64_t) r*p.ncols);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int i = MK_WARP_SIZE*(warp + MK_NWARPS*j) + lane;
-            if (i < ncols4) {
-                float4 v = make_float4(scale*xs[j].x, scale*xs[j].y, scale*xs[j].z, scale*xs[j].w);
-                const float4 m = m4[i];
-                v.x *= m.x;
-                v.y *= m.y;
-                v.z *= m.z;
-                v.w *= m.w;
-                xn4[i]   = v;
-                s_row[i] = v;
-            }
-        }
-        __syncthreads();
+        if (ib < nb_row) {
+            float v = scale*xe;
+            v *= me;
+            p.xn[(int64_t) r*p.ncols + ie] = v;
 
-        // q8_1 of this stream, as quantize_q8_1 writes it for the [ncols*hc] src1 row
-        const float * row = (const float *) s_row;
-        for (int ib = warp; ib < nb_row; ib += MK_NWARPS) {
+            // q8_1 of this stream, as quantize_q8_1 writes it for the [ncols*hc] src1 row
             float d;
             float sum;
-            const int8_t q = quantize_q8_1_lane(row[QK8_1*ib + lane], d, sum);
+            const int8_t q = quantize_q8_1_lane(v, d, sum);
             block_q8_1 & y = p.q8_xn[r*nb_row + ib];
             y.qs[lane] = q;
             if (lane == 0) {
@@ -264,7 +269,7 @@ static __global__ void mk_hc_mix_kernel(const mk_hc_mix_params p) {
         }
     });
     MK_PROF(1);
-    mk_wait(p, 0, p.hc);
+    mk_wait(p, 0, p.hc*tasks_per_row);
     MK_PROF(2);
 
     // stage 2: down matvec, inject in the second grid row like the MMVQ pair launch
@@ -277,39 +282,127 @@ static __global__ void mk_hc_mix_kernel(const mk_hc_mix_params p) {
             bi, has_inject ? 2 : 1);
     });
     MK_PROF(3);
+
+    // stage 3: up matvec, MK_NWARPS*MK_UP_WARP_ROWS rows of gate per task. A block quantizes silu(s*lo + b) into its
+    // own q8_1 copy before its first task.
+    //
+    // The standalone small-K kernel gives a block MK_UP_ROWS rows, but with K <= 512 (<= 16 Q8_0 blocks a row) only its
+    // first 4*blocks_per_row threads have work. Here a warp owns whole rows and keeps all of them in flight; per row it
+    // sums in that kernel's order: thread tid = lane (+32) takes block tid/4, quants 2*(tid%4); warp 0's partial gets
+    // warp 1's then the other warps' zeros added; then the warp butterfly. The weights do not depend on stage 2: the
+    // first task is claimed and its weights loaded before waiting for stage 2.
+    constexpr int qi  = ggml_cuda_type_traits<GGML_TYPE_Q8_0>::qi;
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+    const uint32_t ntask_up = K/MK_UP_TASK_ROWS;
+    const int bpr = p.down_rows/QK8_0;
+    const int kb0 = lane / (qi/vdr);
+    const int kb1 = kb0 + MK_WARP_SIZE / (qi/vdr);
+    const int kqs = vdr * (lane % (qi/vdr));
+
+    int  wv0[MK_UP_WARP_ROWS][vdr];
+    int  wv1[MK_UP_WARP_ROWS][vdr];
+    half wd0[MK_UP_WARP_ROWS];
+    half wd1[MK_UP_WARP_ROWS];
+    auto load_up = [&](uint32_t t) {
+        const int row0 = MK_UP_TASK_ROWS*t + MK_UP_WARP_ROWS*warp;
+#pragma unroll
+        for (int i = 0; i < MK_UP_WARP_ROWS; ++i) {
+            const block_q8_0 * w = (const block_q8_0 *) p.w_up + (row0 + i)*p.up_stride_row;
+            if (kb0 < bpr) {
+#pragma unroll
+                for (int k = 0; k < vdr; ++k) {
+                    wv0[i][k] = get_int_b2(w[kb0].qs, kqs + k);
+                }
+                wd0[i] = w[kb0].d;
+            }
+            if (kb1 < bpr) {
+#pragma unroll
+                for (int k = 0; k < vdr; ++k) {
+                    wv1[i][k] = get_int_b2(w[kb1].qs, kqs + k);
+                }
+                wd1[i] = w[kb1].d;
+            }
+        }
+    };
+
+    uint32_t tu = mk_claim(&p.sync->claim[2], 1);
+    if (tu < ntask_up) {
+        load_up(tu);
+    }
     mk_wait(p, 1, ntask_down);
     MK_PROF(4);
 
-    // stage 3: up matvec, MK_UP_ROWS rows of gate per task. A block quantizes silu(s*lo + b) into its own q8_1 copy
-    // before its first task.
-    {
+    if (tu >= ntask_up) {
+        if (p.diag && mk_thread0()) {
+            atomicAdd(&p.diag->idle[2], 1u);
+        }
+    } else {
         block_q8_1 * q8_act = p.q8_act + blockIdx.x*MK_ACT_BLOCKS;
-        bool act_ready = false;
-        const ggml_cuda_mm_fusion_args_device no_fusion{};
-        mk_tasks(p, 2, K/MK_UP_ROWS, p.chunk_up, [&](uint32_t t) {
-            if (!act_ready) {
-                for (int ib = warp; ib < (int) p.down_rows/QK8_1; ib += MK_NWARPS) {
-                    const int i = QK8_1*ib + lane;
-                    const float v = ggml_cuda_op_silu_single(p.s*p.lo[i] + p.b);
-                    float d;
-                    float sum;
-                    const int8_t q = quantize_q8_1_lane(v, d, sum);
-                    q8_act[ib].qs[lane] = q;
-                    if (lane == 0) {
-                        q8_act[ib].ds = make_half2(d, sum);
-                    }
-                }
-                __syncthreads();
-                act_ready = true;
+        for (int ib = warp; ib < (int) p.down_rows/QK8_1; ib += MK_NWARPS) {
+            const int i = QK8_1*ib + lane;
+            const float v = ggml_cuda_op_silu_single(p.s*p.lo[i] + p.b);
+            float d;
+            float sum;
+            const int8_t q = quantize_q8_1_lane(v, d, sum);
+            q8_act[ib].qs[lane] = q;
+            if (lane == 0) {
+                q8_act[ib].ds = make_half2(d, sum);
             }
-            mul_mat_vec_q_impl<GGML_TYPE_Q8_0, 1, false, true, false>(
-                p.w_up, q8_act, nullptr, no_fusion, p.gate, p.down_rows, make_uint3(0, 0, 0), p.up_stride_row,
-                GGML_PAD(p.down_rows, MATRIX_ROW_PADDING)/QK8_1, K, p.ratio1, 0, 0, 0, p.ratio1, 0, 0, 0, 0,
-                make_uint3(t, 0, 0), 1);
-        });
+        }
+        __syncthreads();
+
+        int  u0[vdr];
+        int  u1[vdr];
+        half ud0 = 0.0f;
+        half ud1 = 0.0f;
+        if (kb0 < bpr) {
+#pragma unroll
+            for (int k = 0; k < vdr; ++k) {
+                u0[k] = get_int_b4(q8_act[kb0].qs, kqs + k);
+            }
+            ud0 = __low2half(q8_act[kb0].ds);
+        }
+        if (kb1 < bpr) {
+#pragma unroll
+            for (int k = 0; k < vdr; ++k) {
+                u1[k] = get_int_b4(q8_act[kb1].qs, kqs + k);
+            }
+            ud1 = __low2half(q8_act[kb1].ds);
+        }
+
+        for (;;) {
+            const int row0 = MK_UP_TASK_ROWS*tu + MK_UP_WARP_ROWS*warp;
+#pragma unroll
+            for (int i = 0; i < MK_UP_WARP_ROWS; ++i) {
+                float tmp0 = 0.0f;
+                float tmp1 = 0.0f;
+                if (kb0 < bpr) {
+                    tmp0 += vec_dot_q8_0_q8_1_impl<float, vdr>(wv0[i], u0, wd0[i], ud0);
+                }
+                if (kb1 < bpr) {
+                    tmp1 += vec_dot_q8_0_q8_1_impl<float, vdr>(wv1[i], u1, wd1[i], ud1);
+                }
+                float sum = tmp0;
+                sum += tmp1;
+#pragma unroll
+                for (int l = 1; l < MK_NWARPS-1; ++l) {
+                    sum += 0.0f;
+                }
+                sum = warp_reduce_sum<MK_WARP_SIZE>(sum);
+                if (lane == 0) {
+                    p.gate[row0 + i] = sum;
+                }
+            }
+            mk_done(&p.sync->done[2], 1);
+            tu = mk_claim(&p.sync->claim[2], 1);
+            if (tu >= ntask_up) {
+                break;
+            }
+            load_up(tu);
+        }
     }
     MK_PROF(5);
-    mk_wait(p, 2, K/MK_UP_ROWS);
+    mk_wait(p, 2, K/MK_UP_TASK_ROWS);
     MK_PROF(6);
 
     // stage 4: dsv4_hc_pre_f32<gated>, a column per thread
@@ -408,11 +501,11 @@ void ggml_cuda_megakernel_prepare(ggml_backend_cuda_context & ctx) {
     }
     ggml_cuda_set_device(ctx.device);
 
-    // Blocks per WGP (GGML_CUDA_MEGAKERNEL_BPW, default 4), capped at the occupancy. The grid need not be co-resident
+    // Blocks per WGP (GGML_CUDA_MEGAKERNEL_BPW, default 8), capped at the occupancy. The grid need not be co-resident
     // for correctness; GGML_CUDA_MEGAKERNEL_OVERSUB=1 drops the cap to test exactly that.
     static const int bpw_env = [] {
         const char * env = getenv("GGML_CUDA_MEGAKERNEL_BPW");
-        return env ? atoi(env) : 4;
+        return env ? atoi(env) : 8;
     }();
     static const bool oversub = [] {
         const char * env = getenv("GGML_CUDA_MEGAKERNEL_OVERSUB");
@@ -447,7 +540,7 @@ bool ggml_cuda_mk_hc_mix_supported(const ggml_cuda_mk_hc_mix & m) {
     const int64_t nlo   = m.w_down->ne[1];
 
     // the rms_norm vec path that runs 1024 threads (ncols/4 in (512, 1024])
-    if (!mk_contiguous_f32(m.x) || ggml_nrows(m.x) != hc || ncols % QK8_1 != 0 || ncols % MK_UP_ROWS != 0 ||
+    if (!mk_contiguous_f32(m.x) || ggml_nrows(m.x) != hc || ncols % QK8_1 != 0 || K % MK_UP_TASK_ROWS != 0 ||
             ncols/4 <= 512 || ncols/4 > MK_MAX_NCOLS4 || K > MK_MAX_K) {
         return false;
     }
@@ -536,7 +629,7 @@ void ggml_cuda_mk_hc_mix_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk
     }();
     static const int chunk_up = [] {
         const char * env = getenv("GGML_CUDA_MEGAKERNEL_CHUNK_UP");
-        return env ? atoi(env) : 4;
+        return env ? atoi(env) : 1;
     }();
     p.chunk_down    = std::max(chunk_down, 1);
     p.chunk_up      = std::max(chunk_up, 1);
@@ -575,7 +668,7 @@ void ggml_cuda_mk_hc_mix_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk
             ps.us[k] += d[k]/100.0;
         }
         if (++ps.n % 1000 == 0) {
-            GGML_LOG_INFO("megakernel prof device %d, %lld launches, us: norm %.2f wait %.2f down %.2f wait %.2f up %.2f "
+            fprintf(stderr, "megakernel prof device %d, %lld launches, us: norm %.2f wait %.2f down %.2f wait %.2f up %.2f "
                           "wait %.2f pre %.2f total %.2f\n", ctx.device, (long long) ps.n, ps.us[0]/ps.n, ps.us[1]/ps.n,
                           ps.us[2]/ps.n, ps.us[3]/ps.n, ps.us[4]/ps.n, ps.us[5]/ps.n, ps.us[6]/ps.n, ps.us[7]/ps.n);
         }
