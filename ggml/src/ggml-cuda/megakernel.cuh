@@ -4,7 +4,7 @@
 
 // [ignite] decode megakernels: a run of batch-1 graph nodes in one launch. Blocks hand work over through task counters
 // (never by waiting on a block that may not be resident), and every node computes in its per-node kernel's order, so
-// results are bit-identical to the per-node path. RDNA3 only. Opt-in: GGML_CUDA_MEGAKERNEL=1.
+// results are bit-identical to the per-node path. RDNA3 only. On by default, GGML_CUDA_MEGAKERNEL=0 turns it off.
 
 bool ggml_cuda_megakernel_enabled(int cc);
 

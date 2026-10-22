@@ -525,10 +525,10 @@ static __global__ void mk_hc_mix_kernel(const mk_hc_mix_params p) {
 }
 
 bool ggml_cuda_megakernel_enabled(int cc) {
-    // opt-in (GGML_CUDA_MEGAKERNEL=1) until the rare cross-block race in the hc mixer is fixed
+    // on by default; GGML_CUDA_MEGAKERNEL=0 turns every segment off
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MEGAKERNEL");
-        return env != nullptr && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0;
     }();
     return enabled && GGML_CUDA_CC_IS_RDNA3_0(cc);
 }
