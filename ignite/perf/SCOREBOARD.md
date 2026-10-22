@@ -35,6 +35,11 @@ CPU contention cost 5-12% (decode is partly CPU/launch bound). Relative A/B resu
 | 2026-10-22 | + one MMVQ launch for two matmuls on one src1, hc down + inject (358b67523) | 46.37 / 46.33 / 46.38 | 36.80 / 36.77 | 21.6 | pair-validate-20261022-0350 |
 | 2026-10-22 | + GDN qkv + z paired (one launch) | **46.83 / 46.83** | **37.04 / 37.00** | 21.4 | qkvz-validate-20261022-0414 |
 
+A/B notes: 85865ffa2 passed the both-runs rule by 0.1% (noise level). 358b67523's first d0 candidate run was
+disturbed (45.12 +- 2.31) and lost; a d0-only rerun won both (46.33 / 46.38 vs 45.83 / 45.84).
+Drafting rows below are single runs of 8 agent requests at temp 1.0 whose outputs diverge between configs: the
+agent-request deltas (+-1-4%) are indicative only; the rewrite gains (2-4x) are solid.
+
 Kernels/token: 3,460 -> 2,991 (quantize_q8_1 737 -> 437). Commits are on local branch `ignite-llama-wip`.
 Calibration: removing 96 launches gave 0.28 ms/token, ~2.9 us per launch; launch overhead is ~8-9 ms of the 21.8 ms
 token. Both GPUs read `power_dpm_force_performance_level = high` (already set before these runs, mclk at max).
@@ -127,6 +132,16 @@ MoE top-k routing likely amplify tiny differences. Consequences:
   fused elementwise kernels.
 - The Phase 4 requant gate must be re-based on this floor: compare a candidate quant against the spread of
   "1-ulp perturbed" FP runs, not against 0.02 absolute (or use a longer text and PPL as the primary metric).
+
+## KLD at ub 256 does not see the decode path (2026-10-22)
+
+`fn-kld.sh` defaults to `-ub 256`: matmuls go to MMQ, src1 is too big for the q8_1 cache slot, and the pair
+fusion and mm epilogues need one row. So the KLD lines in the commit messages of cb37a7edf (q8_1 cache),
+358b67523 (pair) and 19c07de29 (qkv+z pair), and the decode half of 30863089f, compared identical code paths.
+Decode-path check: base from 00f411418 (before all of them) at `FN_KLD_UB=1 FN_KLD_CHUNKS=4`, compared with the
+tip 19c07de29: mean KLD 0.000000, max 0.000055, same top 100% - identical to the control (00f411418 against its
+own base: same max 0.000055, the harness floor at ub 1). All decode-path changes are exact.
+Use `FN_KLD_UB=1 FN_KLD_CHUNKS=4 FN_KLD_BASE=~/llm/kld-base-fn-r1-ub1.bin` for decode-only changes.
 
 ## Trace caveat
 

@@ -10860,6 +10860,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 2557, 1, 640,  {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0,   GGML_TYPE_F32, 640,  1, 2560, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 288, 10, false, 2560, 1, 640));
+    // [ignite] Flash-Next experts at drafter-verify batches (RDNA3 MMVQ up to 8 for these types)
+    for (int n : {5, 6, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 288, 10, false, 640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 288, 10, false, 2560, n, 640));
+    }
     test_cases.emplace_back(new test_mul_mat_pair(GGML_TYPE_Q8_0, 320, 4, 10240));
     test_cases.emplace_back(new test_mul_mat_pair(GGML_TYPE_Q8_0, 4, 320, 10240));
     test_cases.emplace_back(new test_mul_mat_pair(GGML_TYPE_Q6_K, 10240, 6144, 2560));
