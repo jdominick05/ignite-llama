@@ -145,7 +145,13 @@ static __global__ void dsv4_hc_pre_f32(
     dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
-template <bool has_comb>
+// [ignite] gated: post holds the raw injection and the kernel applies g.s2*sigmoid(g.s1*post + g.b1) + g.b2 itself,
+// which is the scale -> sigmoid -> scale chain qwen4exp builds in front of hc_post (three launches fewer per combine)
+struct dsv4_hc_post_gate {
+    float s1, b1, s2, b2;
+};
+
+template <bool has_comb, bool gated = false>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
         const float * residual,
@@ -167,7 +173,8 @@ static __global__ void dsv4_hc_post_f32(
         int64_t sc2,
         int64_t sd0,
         int64_t sd1,
-        int64_t sd2) {
+        int64_t sd2,
+        dsv4_hc_post_gate g = {}) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * hc * n_tokens;
@@ -182,7 +189,11 @@ static __global__ void dsv4_hc_post_f32(
     const int64_t idst = (ir / n_embd) % hc;
     const int64_t it   = ir / (n_embd * hc);
 
-    float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
+    float p = post[idst*sp0 + it*sp1];
+    if constexpr (gated) {
+        p = g.s2 / (1.0f + expf(-(g.s1*p + g.b1))) + g.b2;
+    }
+    float sum = x[i0*sx0 + it*sx1] * p;
     if constexpr (has_comb) {
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
             sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
@@ -272,10 +283,10 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             scale);
 }
 
-void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void dsv4_hc_post_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * post,
+                                const dsv4_hc_post_gate * gate) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
-    const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
@@ -303,7 +314,8 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = comb ? dsv4_hc_post_f32<true> : dsv4_hc_post_f32<false>;
+    auto kernel = gate ? (comb ? dsv4_hc_post_f32<true, true>  : dsv4_hc_post_f32<false, true>)
+                       : (comb ? dsv4_hc_post_f32<true, false> : dsv4_hc_post_f32<false, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
@@ -312,5 +324,44 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
+            gate ? *gate : dsv4_hc_post_gate{});
+}
+
+void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    dsv4_hc_post_launch(ctx, dst, dst->src[2], nullptr);
+}
+
+// [ignite] nodes i..i+3 = SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST (weights = src[2]): one launch instead of four
+bool ggml_cuda_dsv4_hc_post_try_fuse_gate(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (i + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * sc1  = cgraph->nodes[i];
+    const ggml_tensor * sig  = cgraph->nodes[i + 1];
+    const ggml_tensor * sc2  = cgraph->nodes[i + 2];
+    ggml_tensor *       post = cgraph->nodes[i + 3];
+    if (sc1->op != GGML_OP_SCALE || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+        sc2->op != GGML_OP_SCALE || post->op != GGML_OP_DSV4_HC_POST) {
+        return false;
+    }
+    if (sig->src[0] != sc1 || sc2->src[0] != sig || post->src[2] != sc2) {
+        return false;
+    }
+    for (int k = 0; k < 3; ++k) {
+        const ggml_tensor * n = cgraph->nodes[i + k];
+        if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_node_has_n_uses(cgraph, i + k, 1) ||
+            n->type != GGML_TYPE_F32 || !ggml_are_same_shape(n, sc1->src[0])) {
+            return false;
+        }
+    }
+    if (sc1->src[0]->type != GGML_TYPE_F32 || sc1->src[0]->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const dsv4_hc_post_gate gate = {
+        ggml_get_op_params_f32(sc1, 0), ggml_get_op_params_f32(sc1, 1),
+        ggml_get_op_params_f32(sc2, 0), ggml_get_op_params_f32(sc2, 1),
+    };
+    dsv4_hc_post_launch(ctx, post, sc1->src[0], &gate);
+    return true;
 }

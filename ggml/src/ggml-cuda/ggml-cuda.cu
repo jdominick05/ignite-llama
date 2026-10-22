@@ -4518,6 +4518,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    if (node->op == GGML_OP_SCALE && ggml_cuda_dsv4_hc_post_try_fuse_gate(*cuda_ctx, cgraph, i)) {
+        return 3;
+    }
+
     return 0;
 }
 
