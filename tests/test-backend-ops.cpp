@@ -3569,6 +3569,39 @@ struct test_softcap : public test_case {
     }
 };
 
+// [ignite] SCALE -> UNARY (silu / sigmoid), run as a whole graph so backends can fuse it
+struct test_scale_unary : public test_case {
+    const ggml_unary_op op;
+    const std::array<int64_t, 4> ne;
+    float s;
+    float b;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_UNARY";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(op, ne, s, b);
+    }
+
+    test_scale_unary(ggml_unary_op op = GGML_UNARY_OP_SILU, std::array<int64_t, 4> ne = {10, 10, 10, 10},
+            float s = 0.25f, float b = 0.0f)
+        : op(op), ne(ne), s(s), b(b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_unary(ctx, ggml_scale_bias(ctx, a, s, b), op);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SILU_BACK
 struct test_silu_back : public test_case {
     const ggml_type type;
@@ -9762,6 +9795,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1, true, true));
+    test_cases.emplace_back(new test_scale_unary(GGML_UNARY_OP_SILU, {64, 1, 1, 1}));
+    test_cases.emplace_back(new test_scale_unary(GGML_UNARY_OP_SILU, {1024, 7, 1, 1}, 0.25f, 0.5f));
+    test_cases.emplace_back(new test_scale_unary(GGML_UNARY_OP_SIGMOID, {10, 10, 10, 10}, 2.0f, -1.0f));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));

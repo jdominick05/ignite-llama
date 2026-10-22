@@ -4522,6 +4522,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 3;
     }
 
+    {
+        static const ggml_op scale_unary_ops[] = { GGML_OP_SCALE, GGML_OP_UNARY };
+        if (node->op == GGML_OP_SCALE && ggml_can_fuse(cgraph, i, scale_unary_ops, 2) &&
+            ggml_cuda_scale_unary_supported(node, cgraph->nodes[i + 1])) {
+            ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1]);
+            return 1;
+        }
+    }
+
     return 0;
 }
 

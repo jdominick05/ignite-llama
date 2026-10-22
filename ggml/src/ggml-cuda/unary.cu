@@ -778,3 +778,54 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+/* [ignite] fused scale + unary: dst = op(s*x + b), one launch instead of two (qwen4exp hc mixer: silu(x/hc)) */
+
+template <float (*op)(float)>
+static __global__ void scale_unary_kernel(const float * x, float * dst, const int64_t k, const float s, const float b) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    dst[i] = op(s*x[i] + b);
+}
+
+template <float (*op)(float)>
+static void scale_unary_cuda(const float * x, float * dst, const int64_t k, const float s, const float b, cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(scale_unary_kernel<op>, launch_params, x, dst, k, s, b);
+}
+
+bool ggml_cuda_scale_unary_supported(const ggml_tensor * scale_node, const ggml_tensor * unary_node) {
+    const ggml_unary_op uop = ggml_get_unary_op(unary_node);
+    if (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const ggml_tensor * src = scale_node->src[0];
+    return src->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32 && unary_node->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(src) && ggml_is_contiguous(unary_node);
+}
+
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node) {
+    const float s = ggml_get_op_params_f32(scale_node, 0);
+    const float b = ggml_get_op_params_f32(scale_node, 1);
+    const float * x = (const float *) scale_node->src[0]->data;
+    float * dst     = (float *) unary_node->data;
+    const int64_t k = ggml_nelements(unary_node);
+
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SILU:
+            scale_unary_cuda<op_silu>(x, dst, k, s, b, ctx.stream());
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            scale_unary_cuda<op_sigmoid>(x, dst, k, s, b, ctx.stream());
+            break;
+        default:
+            GGML_ABORT("Unsupported unary op for fused scale+unary");
+    }
+}
