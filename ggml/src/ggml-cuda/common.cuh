@@ -1615,6 +1615,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    // [ignite] a second weight on the same src1 (same type and K), computed by an extra grid row into second_dst
+    const ggml_tensor * second_x = nullptr;
+    ggml_tensor * second_dst = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1628,6 +1631,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    const void * second_x = nullptr;
+    float * second_dst = nullptr;
+    uint32_t second_nrows = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

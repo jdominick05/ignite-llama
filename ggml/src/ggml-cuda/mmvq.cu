@@ -667,11 +667,21 @@ static __global__ void mul_mat_vec_q(
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
-    const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
+    // [ignite] the second weight on the same src1 takes the last grid row; its blocks past its rows have no work
+    const bool second_x = has_fusion && fusion.second_x && blockIdx.y == gridDim.y - 1;
+    const uint32_t channel_dst = shared_expert || second_x ? 0 : blockIdx.y;
     if (shared_expert) {
         vx = fusion.shared_up;
         dst = fusion.shared_dst;
         stride_col_dst = fusion.shared_stride_col_dst;
+    }
+    if (second_x) {
+        if (row0 >= (int) fusion.second_nrows) {
+            return;
+        }
+        vx = fusion.second_x;
+        dst = fusion.second_dst;
+        stride_col_dst = fusion.second_nrows;
     }
 
     uint32_t channel_x;
@@ -1073,7 +1083,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t ids_stride, cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.second_x != nullptr;
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -1110,7 +1120,7 @@ static void mul_mat_vec_q_moe_launch(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.second_x != nullptr;
 
     if (has_fusion) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
@@ -1249,7 +1259,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
 
-                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst + (fusion.shared_up != nullptr),
+                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst + (fusion.shared_up != nullptr) + (fusion.second_x != nullptr),
                                                                               nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1558,6 +1568,17 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
             GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
             fusion_local.gate_scale = fusion->gate_scale->data;
+        }
+        if (fusion->second_x) {
+            const ggml_tensor * x2 = fusion->second_x;
+            const ggml_tensor * d2 = fusion->second_dst;
+            GGML_ASSERT(!ids && !fusion->shared_up && ne1 == 1 && ne02 == 1 && ne03 == 1);
+            GGML_ASSERT(x2->type == src0->type && x2->ne[0] == ne00 && x2->nb[1] == nb01 && ggml_is_matrix(x2));
+            GGML_ASSERT(x2->ne[1] <= ne01);
+            GGML_ASSERT(d2->type == GGML_TYPE_F32 && ggml_is_contiguous(d2) && d2->ne[0] == x2->ne[1] && ggml_nrows(d2) == 1);
+            fusion_local.second_x     = x2->data;
+            fusion_local.second_dst   = (float *) d2->data;
+            fusion_local.second_nrows = x2->ne[1];
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;

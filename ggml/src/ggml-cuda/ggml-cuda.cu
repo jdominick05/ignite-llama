@@ -3759,6 +3759,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // [ignite] two adjacent batch-1 MMVQs on the same src1 with the same weight type and K run as one launch, the smaller
+    // weight in an extra grid row (qwen4exp: hc down + inject, GDN qkv + z, ssm alpha + beta). GGML_CUDA_MMVQ_PAIR=0: off
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
+        static const bool pair_enabled = [] {
+            const char * env = getenv("GGML_CUDA_MMVQ_PAIR");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        ggml_tensor * a = node;
+        ggml_tensor * b = cgraph->nodes[i + 1];
+        if (pair_enabled && b->op == GGML_OP_MUL_MAT && (b->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                b->src[1] == a->src[1] && b->src[0] != a && b->src[1] != a &&
+                a->src[0]->type == b->src[0]->type && a->src[0]->ne[0] == b->src[0]->ne[0] &&
+                a->src[0]->nb[1] == b->src[0]->nb[1] && ggml_is_matrix(a->src[0]) && ggml_is_matrix(b->src[0]) &&
+                ggml_nrows(a) == 1 && ggml_nrows(b) == 1 && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(a) && ggml_cuda_should_fuse_mul_mat_vec_q(b)) {
+            if (b->src[0]->ne[1] > a->src[0]->ne[1]) {
+                std::swap(a, b);
+            }
+            const int outputs[] = { i, i + 1 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 2)) {
+                ggml_cuda_mm_fusion_args_host fusion{};
+                fusion.second_x   = b->src[0];
+                fusion.second_dst = b;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, a->src[0], a->src[1], nullptr, a, &fusion);
+                return 1;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
