@@ -11,6 +11,19 @@
 static_assert(MATRIX_ROW_PADDING %    CUDA_QUANTIZE_BLOCK_SIZE      == 0, "Risk of out-of-bounds access.");
 static_assert(MATRIX_ROW_PADDING % (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) == 0, "Risk of out-of-bounds access.");
 
+// [ignite] one value of a 32-wide q8_1 block, called by all 32 lanes of a warp: shared by quantize_q8_1 and the
+// megakernel, so both produce the same bytes
+static __device__ __forceinline__ int8_t quantize_q8_1_lane(const float xi, float & d, float & sum) {
+    float amax = fabsf(xi);
+    sum = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    d = amax / 127.0f;
+    return amax == 0.0f ? 0 : roundf(xi / d);
+}
+
 typedef void (*quantize_cuda_t)(
         const float * x, const int32_t * ids, void * vy,
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
