@@ -212,3 +212,10 @@ dispatch gaps 24% (~3.8 us/kernel), waiting on the XT 48% (`gapsplit.py`).
 - `fn-bench.sh <build> [KNOB=off KNOB=on]`: alternating A/B, d0 + d64k.
 - `fn-trace.sh <build> [ENV=...]`: rocprofv3 trace + `kinventory.py` + `mmvq_bw.py`.
 - `bw_theory.py <gguf>`: bytes/token and the bandwidth ceiling.
+
+- 2026-10-22, rejected: folding the gated hc_post before an hc mixer into the mixer's norm stage (x = out*p + residual
+  computed where the norm loads it). Bit-exact and fires at every GDN/QSA site (XTX hc_post 924 -> 33 per trace), but
+  d0 56.94/57.17 off vs 56.81/56.85 on: every norm task reads two rows instead of one, and that stage gates the rest.
+  An hc_post epilogue in the producing matvec (ssm_out / attn out) would avoid the extra reads. Also: the optional
+  path as a runtime branch changed the plain path's numerics (KLD 0.015 with the branch never taken); as a template
+  instantiation it was exact.
