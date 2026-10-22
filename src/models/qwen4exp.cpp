@@ -636,6 +636,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
+    // z is only consumed by the gated norm after the delta net: expand it here so its matvec runs next to qkv
+    ggml_build_forward_expand(gf, z);
 
     return { qkv_mixed, z };
 }
