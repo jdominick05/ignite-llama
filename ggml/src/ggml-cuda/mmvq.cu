@@ -629,6 +629,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 return 1;
         }
     }
+    // [ignite] RDNA3: small K (Flash-Next hc_*_up K=320 Q8_0, ffn_down_exps K=640 IQ4_NL) leaves most of the 8 warps idle
+    // on a single row, so give each block nwarps rows like the generic table does
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst == 1 && small_k) {
+        return nwarps;
+    }
     return 1;
 }
 
@@ -1173,6 +1178,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
             GGML_TYPE_Q3_K,
         };
 
+        // [ignite] GGML_CUDA_MMVQ_SMALL_K=0 restores upstream (no small-K rows per block on RDNA3)
+        static const bool rdna3_small_k = [] {
+            const char * env = getenv("GGML_CUDA_MMVQ_SMALL_K");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        const bool rdna_small_k = GGML_CUDA_CC_IS_RDNA3_0(cc) && ncols_dst == 1 && rdna3_small_k;
+
         const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
         const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
 
@@ -1183,7 +1195,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
         } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
-                GGML_CUDA_CC_IS_RDNA(cc)) {
+                (GGML_CUDA_CC_IS_RDNA(cc) && !rdna_small_k)) {
             use = false;
         }
 
