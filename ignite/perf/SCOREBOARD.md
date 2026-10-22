@@ -34,7 +34,12 @@ CPU contention cost 5-12% (decode is partly CPU/launch bound). Relative A/B resu
 | 2026-10-22 | + RDNA3 MMID MMVQ up to batch 8 for IQ3_XXS/IQ4_NL (b2e7ac253; drafter verify only, tg unchanged) | 45.90 / 45.75 | 36.50 / 36.38 | 21.8 | fn-verify-mmid8, pair-validate |
 | 2026-10-22 | + one MMVQ launch for two matmuls on one src1, hc down + inject (358b67523) | 46.37 / 46.33 / 46.38 | 36.80 / 36.77 | 21.6 | pair-validate-20261022-0350 |
 | 2026-10-22 | + GDN qkv + z paired (one launch) | **46.83 / 46.83** | **37.04 / 37.00** | 21.4 | qkvz-validate-20261022-0414 |
+| 2026-10-22 | after reboot, XT drives a display, DPM `high` via gpu-high (baseline, megakernel off) | 47.15 / 47.20 | 37.33 / 37.41 | 21.2 | fn-bench-20261022-1* |
+| 2026-10-22 | + hc-mix megakernel (2a56a4c2d, f668169bc), `GGML_CUDA_MEGAKERNEL=1` | 49.04 / 49.21 | 38.08 / 38.67 | 20.4 | fn-bench-20261022-1* |
+| 2026-10-22 | + GDN segment megakernel (opt-in, same knob) | **53.58 / 53.71** | **41.37 / 41.38** | 18.6 | fn-bench-20261022-1* |
 
+Megakernel rows are bit-identical to the per-node path (ub1 KLD equals the identical-code control). DPM `auto`
+costs ~13% (40.6 tok/s); a runtime-suspended XTX silently drops a forced `high`, so benches run under `gpu-high`.
 A/B notes: 85865ffa2 passed the both-runs rule by 0.1% (noise level). 358b67523's first d0 candidate run was
 disturbed (45.12 +- 2.31) and lost; a d0-only rerun won both (46.33 / 46.38 vs 45.83 / 45.84).
 Drafting rows below are single runs of 8 agent requests at temp 1.0 whose outputs diverge between configs: the
