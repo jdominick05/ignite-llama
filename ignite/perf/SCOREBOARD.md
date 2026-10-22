@@ -36,7 +36,9 @@ CPU contention cost 5-12% (decode is partly CPU/launch bound). Relative A/B resu
 | 2026-10-22 | + GDN qkv + z paired (one launch) | **46.83 / 46.83** | **37.04 / 37.00** | 21.4 | qkvz-validate-20261022-0414 |
 | 2026-10-22 | after reboot, XT drives a display, DPM `high` via gpu-high (baseline, megakernel off) | 47.15 / 47.20 | 37.33 / 37.41 | 21.2 | fn-bench-20261022-1* |
 | 2026-10-22 | + hc-mix megakernel (2a56a4c2d, f668169bc), `GGML_CUDA_MEGAKERNEL=1` | 49.04 / 49.21 | 38.08 / 38.67 | 20.4 | fn-bench-20261022-1* |
-| 2026-10-22 | + GDN segment megakernel (opt-in, same knob) | **53.58 / 53.71** | **41.37 / 41.38** | 18.6 | fn-bench-20261022-1* |
+| 2026-10-22 | + GDN segment megakernel (opt-in, same knob) | 53.58 / 53.71 | 41.37 / 41.38 | 18.6 | fn-bench-20261022-1* |
+| 2026-10-22 | megakernels default on (779d6576a) + DPP topk (04fd0b5fd) | 53.91 / 53.86 | 41.48 / 41.50 | 18.6 | fn-bench-20261022-1* |
+| 2026-10-22 | + shared expert first, FFN tail segment | **55.20 / 55.17** | **42.33 / 42.15** | 18.1 | fn-bench-20261022-1* |
 
 Expert matvecs (2026-10-22, negative, do not retry as-is): the `n_mats=288` perf cases run from Infinity Cache at
 the model's DRAM speed (IQ4_NL down 20.4 us vs 21.5 in the model), so they are bound by IQ3_XXS/IQ4_NL dequant
