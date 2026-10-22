@@ -38,6 +38,11 @@ CPU contention cost 5-12% (decode is partly CPU/launch bound). Relative A/B resu
 | 2026-10-22 | + hc-mix megakernel (2a56a4c2d, f668169bc), `GGML_CUDA_MEGAKERNEL=1` | 49.04 / 49.21 | 38.08 / 38.67 | 20.4 | fn-bench-20261022-1* |
 | 2026-10-22 | + GDN segment megakernel (opt-in, same knob) | **53.58 / 53.71** | **41.37 / 41.38** | 18.6 | fn-bench-20261022-1* |
 
+Expert matvecs (2026-10-22, negative, do not retry as-is): the `n_mats=288` perf cases run from Infinity Cache at
+the model's DRAM speed (IQ4_NL down 20.4 us vs 21.5 in the model), so they are bound by IQ3_XXS/IQ4_NL dequant
+arithmetic, not memory. IQ3_XXS gate/up with 2 or 4 rows per one-warp block: 13.04 / 13.40 us vs 12.91 (XTX);
+iq3xxs_grid copied to shared memory per block: 14.86 us. Per-wave SQ counters read 0 on gfx1100 here; count VALU
+ops from the disassembly instead.
 Megakernel rows are bit-identical to the per-node path (ub1 KLD equals the identical-code control). DPM `auto`
 costs ~13% (40.6 tok/s); a runtime-suspended XTX silently drops a forced `high`, so benches run under `gpu-high`.
 A/B notes: 85865ffa2 passed the both-runs rule by 0.1% (noise level). 358b67523's first d0 candidate run was
