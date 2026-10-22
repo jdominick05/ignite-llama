@@ -79,6 +79,17 @@ struct mk_diag {
 };
 static constexpr size_t MK_DIAG_SIZE = sizeof(mk_diag);
 
+// gated delta net segment scratch: attention and gated output [128*H] each, the per-head and all-task counters
+static constexpr int    MK_GDN_S       = 128;
+static constexpr int    MK_GDN_MAX_H   = 64;
+static constexpr int    MK_GDN_MAX_K   = 4096;  // hc_mixed length (alpha/beta matvec K)
+static constexpr int    MK_GDN_QUARTERS = 4;    // tasks per v head, 32 columns each (8 warps x 4 columns)
+static constexpr size_t MK_GDN_OFF_ATTN = 0;
+static constexpr size_t MK_GDN_OFF_OUT  = MK_GDN_OFF_ATTN + (size_t) MK_GDN_MAX_H*MK_GDN_S*sizeof(float);
+static constexpr size_t MK_GDN_OFF_CNT  = MK_GDN_OFF_OUT  + (size_t) MK_GDN_MAX_H*MK_GDN_S*sizeof(float);
+static constexpr size_t MK_GDN_SIZE     = MK_GDN_OFF_CNT + (2*MK_GDN_MAX_H + 1)*sizeof(uint32_t);
+static constexpr size_t MK_GDN_BASE     = MK_BUF_SIZE + MK_PROF_SIZE + MK_DIAG_SIZE;
+
 // bounded spin: a scheduling or logic mistake sets the error flag instead of hanging the GPU
 static constexpr int MK_SPIN_LIMIT = 1 << 26;
 
@@ -597,8 +608,8 @@ void ggml_cuda_megakernel_prepare(ggml_backend_cuda_context & ctx) {
         return;
     }
 
-    CUDA_CHECK(cudaMalloc((void **) &ctx.mk_buf, MK_BUF_SIZE + MK_PROF_SIZE + MK_DIAG_SIZE));
-    CUDA_CHECK(cudaMemset(ctx.mk_buf, 0, MK_BUF_SIZE + MK_PROF_SIZE + MK_DIAG_SIZE));
+    CUDA_CHECK(cudaMalloc((void **) &ctx.mk_buf, MK_GDN_BASE + MK_GDN_SIZE));
+    CUDA_CHECK(cudaMemset(ctx.mk_buf, 0, MK_GDN_BASE + MK_GDN_SIZE));
     ctx.mk_grid = grid;
     GGML_LOG_INFO("%s: device %d: megakernel grid %d (%d blocks per WGP, occupancy %d/%d%s)\n",
                   __func__, ctx.device, grid, bpw, occ_a, occ_b, oversub ? ", oversubscribed" : "");
@@ -761,4 +772,372 @@ void ggml_cuda_mk_hc_mix_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// gated delta net segment
+
+struct mk_gdn_params {
+    const int32_t * s_copy;
+    const float *   conv_src;
+    int64_t         conv_src_row;   // floats between cache_r rows
+    float *         conv_dst;
+    const float *   qkv;
+    const float *   conv_w;
+    const float *   state_src;
+    int64_t         state_src_row;
+    float *         state_dst;
+    float           eps_q;
+    float           scale_q;
+    float           eps_k;
+    float           scale_k;
+    const float *   x;
+    int             K;
+    const void *    w_alpha;
+    const float *   alpha_bias;
+    const float *   ssm_a;
+    const void *    w_beta;
+    uint32_t        w_stride_row;
+    float           gdn_scale;
+    const float *   z;
+    const float *   w_onorm;
+    float           eps_o;
+    float *         out;
+    float *         attn;           // scratch [128*H]
+    float *         out_s;          // scratch [128*H]
+    uint32_t *      cnt_v;          // [H]
+    uint32_t *      cnt_k;          // [HK]
+    uint32_t *      cnt_all;
+    int             H;
+    int             HK;
+};
+
+#ifdef MK_DEVICE_CODE
+// the per-node kernels' element functions (unary.cu op_softplus, op_sigmoid)
+static __device__ __forceinline__ float mk_softplus(float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+static __device__ __forceinline__ float mk_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// true in every thread of the block when this block is the n-th to arrive at *cnt (which it then resets). The
+// release covers the block's earlier loads too: the last block may overwrite what the others read.
+static __device__ __forceinline__ bool mk_last_of(uint32_t * cnt, uint32_t n) {
+    __shared__ bool s_last;
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    __syncthreads();
+    if (mk_thread0()) {
+        s_last = __hip_atomic_fetch_add(cnt, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) == n - 1;
+        if (s_last) {
+            __hip_atomic_store(cnt, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+    }
+    __syncthreads();
+    const bool last = s_last;
+    if (last) {
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
+    return last;
+}
+#endif // MK_DEVICE_CODE
+
+__launch_bounds__(MK_WARP_SIZE*MK_NWARPS, 1)
+static __global__ void mk_gdn_kernel(const mk_gdn_params p) {
+#ifdef MK_DEVICE_CODE
+    constexpr int S             = MK_GDN_S;
+    constexpr int cols_per_task = S/MK_GDN_QUARTERS;
+    constexpr int cols_per_warp = 4;                        // gated_delta_net_cuda<128>: gdn_cols_per_warp
+    constexpr int lanes_per_col = MK_WARP_SIZE/cols_per_warp;
+    constexpr int rows_per_lane = S/lanes_per_col;
+    static_assert(cols_per_task == MK_NWARPS*cols_per_warp, "a task is one column per 8 lanes");
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid  = MK_WARP_SIZE*warp + lane;
+
+    const int h  = blockIdx.x / MK_GDN_QUARTERS;  // v head
+    const int j  = blockIdx.x % MK_GDN_QUARTERS;  // column quarter
+    const int kh = h % p.HK;                      // q/k head (gated_delta_net_cuda: h_idx mod neqk1)
+
+    const int ch_q = kh*S;
+    const int ch_k = p.HK*S + kh*S;
+    const int ch_v = 2*p.HK*S + h*S + j*cols_per_task;
+
+    __shared__ block_q8_1 s_x8[MK_GDN_MAX_K/QK8_1];
+    __shared__ float      s_alpha[MK_GDN_MAX_H];
+    __shared__ float      s_beta[MK_GDN_MAX_H];
+    __shared__ float4     s_c[2*S/4 + cols_per_task/4]; // conv output: q, k, this task's v
+    __shared__ float4     s_qk[2*S/4];                  // normalized q, k
+
+    const int64_t row_c = p.s_copy[0];
+
+    // q8_1 of x, as quantize_q8_1 writes it for the alpha/beta matvecs
+    for (int ib = warp; ib < p.K/QK8_1; ib += MK_NWARPS) {
+        float d;
+        float sum;
+        const int8_t q = quantize_q8_1_lane(p.x[QK8_1*ib + lane], d, sum);
+        s_x8[ib].qs[lane] = q;
+        if (lane == 0) {
+            s_x8[ib].ds = make_half2(d, sum);
+        }
+    }
+
+    // conv + silu (ssm_conv_f32<true>): q and k channels of head kh (read by all 12 tasks of kh), this task's v channels
+    float * c = (float *) s_c;
+    for (int e = tid; e < 2*S + cols_per_task; e += MK_WARP_SIZE*MK_NWARPS) {
+        const int ch = e < S ? ch_q + e : e < 2*S ? ch_k + e - S : ch_v + e - 2*S;
+        const float * st = p.conv_src + row_c*p.conv_src_row + 3*ch;
+        float xc[4];
+        xc[0] = st[0];
+        xc[1] = st[1];
+        xc[2] = st[2];
+        xc[3] = p.qkv[ch];
+        float w[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            w[k] = p.conv_w[4*ch + k];
+        }
+        float sumf = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            sumf += xc[k] * w[k];
+        }
+        sumf += 0.0f; // no conv bias
+        c[e] = ggml_cuda_op_silu_single(sumf);
+        if (e >= 2*S) {
+            // v channels have one owner: shift its conv state now
+            float * dt = p.conv_dst + 3*ch;
+            dt[0] = xc[1];
+            dt[1] = xc[2];
+            dt[2] = xc[3];
+        }
+    }
+    __syncthreads();
+
+    // alpha and beta of head h (mul_mat_vec_q, alpha with the fused bias), then softplus*a and sigmoid
+    {
+        ggml_cuda_mm_fusion_args_device fa{};
+        fa.x_bias = p.alpha_bias;
+        const ggml_cuda_mm_fusion_args_device fb{};
+        const uint3 one = make_uint3(1, 0, 0);
+        mul_mat_vec_q_impl<GGML_TYPE_Q8_0, 1, true, false, false>(
+            p.w_alpha, s_x8, nullptr, fa, s_alpha, p.K, make_uint3(0, 0, 0), p.w_stride_row,
+            GGML_PAD(p.K, MATRIX_ROW_PADDING)/QK8_1, p.H, one, 0, 0, 0, one, 0, 0, 0, 0, make_uint3(h, 0, 0), 1);
+        __syncthreads();
+        mul_mat_vec_q_impl<GGML_TYPE_Q8_0, 1, false, false, false>(
+            p.w_beta, s_x8, nullptr, fb, s_beta, p.K, make_uint3(0, 0, 0), p.w_stride_row,
+            GGML_PAD(p.K, MATRIX_ROW_PADDING)/QK8_1, p.H, one, 0, 0, 0, one, 0, 0, 0, 0, make_uint3(h, 0, 0), 1);
+        __syncthreads();
+    }
+
+    // rms_norm_f32<32, 1, vec, do_scale>: warp 0 q, warp 1 k, a float4 per lane
+    if (warp < 2) {
+        const float4 xs   = s_c[warp*S/4 + lane];
+        const float  eps  = warp == 0 ? p.eps_q : p.eps_k;
+        const float  sout = warp == 0 ? p.scale_q : p.scale_k;
+        float tmp = 0.0f;
+        tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+        tmp = warp_reduce_sum<MK_WARP_SIZE>(tmp);
+        const float scale = rsqrtf(tmp / S + eps);
+        float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+        r.x *= sout;
+        r.y *= sout;
+        r.z *= sout;
+        r.w *= sout;
+        s_qk[warp*S/4 + lane] = r;
+    }
+
+    // the 12 tasks of q/k head kh have read its old conv state: the last one shifts it
+    if (mk_last_of(&p.cnt_k[kh], (p.H/p.HK)*MK_GDN_QUARTERS)) {
+        for (int e = tid; e < 2*S; e += MK_WARP_SIZE*MK_NWARPS) {
+            const int ch = e < S ? ch_q + e : ch_k + e - S;
+            const float * st = p.conv_src + row_c*p.conv_src_row + 3*ch;
+            const float s1 = st[1];
+            const float s2 = st[2];
+            float * dt = p.conv_dst + 3*ch;
+            dt[0] = s1;
+            dt[1] = s2;
+            dt[2] = p.qkv[ch];
+        }
+    }
+
+    // gated_delta_net_cuda<128, !KDA, !keep_rs_t>: 8 lanes per column, 16 state rows per lane
+    {
+        const int col_in_warp = lane / lanes_per_col;
+        const int lane_in_col = lane - col_in_warp*lanes_per_col;
+        const int col_local   = cols_per_warp*warp + col_in_warp;
+        const int col         = j*cols_per_task + col_local;
+
+        const float * src = p.state_src + row_c*p.state_src_row + (int64_t) h*S*S + col*S;
+        float s_shard[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r] = src[r*lanes_per_col + lane_in_col];
+        }
+        const float * qn = (const float *) s_qk;
+        const float * kn = qn + S;
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r*lanes_per_col + lane_in_col;
+            k_reg[r] = kn[i];
+            q_reg[r] = qn[i];
+        }
+
+        const float g_val    = expf(mk_softplus(s_alpha[h]) * p.ssm_a[h]);
+        const float beta_val = mk_sigmoid(s_beta[h]);
+
+        float kv_shard = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            kv_shard += s_shard[r] * k_reg[r];
+        }
+        const float kv_col = warp_reduce_sum<lanes_per_col>(kv_shard);
+
+        const float delta_col = (c[2*S + col_local] - g_val * kv_col) * beta_val;
+
+        float attn_partial = 0.0f;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
+            attn_partial += s_shard[r] * q_reg[r];
+        }
+        const float attn_col = warp_reduce_sum<lanes_per_col>(attn_partial);
+        if (lane_in_col == 0) {
+            p.attn[h*S + col] = attn_col * p.gdn_scale;
+        }
+
+        float * dst = p.state_dst + (int64_t) h*S*S + col*S;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            dst[r*lanes_per_col + lane_in_col] = s_shard[r];
+        }
+    }
+
+    // the last of the 4 tasks of head h: rms_norm_f32<32, 1, vec, do_multiply>, then sigmoid(z)*x
+    if (mk_last_of(&p.cnt_v[h], MK_GDN_QUARTERS) && warp == 0) {
+        const float4 xs = ((const float4 *) (p.attn + h*S))[lane];
+        float tmp = 0.0f;
+        tmp += xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
+        tmp = warp_reduce_sum<MK_WARP_SIZE>(tmp);
+        const float scale = rsqrtf(tmp / S + p.eps_o);
+        float4 r = make_float4(scale*xs.x, scale*xs.y, scale*xs.z, scale*xs.w);
+        const float4 m = ((const float4 *) p.w_onorm)[lane];
+        r.x *= m.x;
+        r.y *= m.y;
+        r.z *= m.z;
+        r.w *= m.w;
+        const float4 zz = ((const float4 *) (p.z + h*S))[lane];
+        float4 o;
+        o.x = mk_sigmoid(zz.x) * r.x;
+        o.y = mk_sigmoid(zz.y) * r.y;
+        o.z = mk_sigmoid(zz.z) * r.z;
+        o.w = mk_sigmoid(zz.w) * r.w;
+        ((float4 *) (p.out_s + h*S))[lane] = o;
+    }
+
+    // out may share memory with an input (gallocr reuses qkv for it): the last task, after every read, writes it
+    if (mk_last_of(p.cnt_all, gridDim.x)) {
+        for (int e = tid; e < p.H*S/4; e += MK_WARP_SIZE*MK_NWARPS) {
+            ((float4 *) p.out)[e] = ((const float4 *) p.out_s)[e];
+        }
+    }
+#else
+    GGML_UNUSED(p);
+    NO_DEVICE_CODE;
+#endif // MK_DEVICE_CODE
+}
+
+static bool mk_is_q8_0_rows(const ggml_tensor * w, int64_t K, int64_t rows) {
+    return w->type == GGML_TYPE_Q8_0 && w->ne[0] == K && w->ne[1] == rows && ggml_nrows(w) == rows &&
+        w->nb[0] == ggml_type_size(GGML_TYPE_Q8_0) && w->nb[1] == ggml_row_size(GGML_TYPE_Q8_0, K);
+}
+
+bool ggml_cuda_mk_gdn_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MEGAKERNEL_GDN");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+bool ggml_cuda_mk_gdn_supported(const ggml_cuda_mk_gdn & m) {
+    const int64_t S    = MK_GDN_S;
+    const int64_t H    = m.H;
+    const int64_t HK   = m.HK;
+    const int64_t n_ch = 2*HK*S + H*S;
+    const int64_t K    = m.x->ne[0];
+    if (H <= 0 || H > MK_GDN_MAX_H || HK <= 0 || H % HK != 0 || K % QK8_1 != 0 || K > MK_GDN_MAX_K) {
+        return false;
+    }
+    const auto f32c = [](const ggml_tensor * t, int64_t n) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == n;
+    };
+    if (m.s_copy->type != GGML_TYPE_I32 || ggml_nelements(m.s_copy) != 1) {
+        return false;
+    }
+    // cache rows: contiguous within a row, rows of the expected length
+    if (m.conv_src->type != GGML_TYPE_F32 || m.conv_src->ne[0] != 3*n_ch || m.conv_src->nb[0] != sizeof(float) ||
+            m.conv_src->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+    if (m.state_src->type != GGML_TYPE_F32 || m.state_src->ne[0] != S*S*H || m.state_src->nb[0] != sizeof(float) ||
+            m.state_src->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+    if (!f32c(m.conv_dst, 3*n_ch) || !f32c(m.state_dst, S*S*H) || !f32c(m.qkv, n_ch) || !f32c(m.conv_w, 4*n_ch) ||
+            m.conv_w->ne[0] != 4 || !f32c(m.x, K) || !f32c(m.alpha_bias, H) || !f32c(m.ssm_a, H) || !f32c(m.z, S*H) ||
+            !f32c(m.w_onorm, S) || !f32c(m.out, S*H)) {
+        return false;
+    }
+    if (!mk_is_q8_0_rows(m.w_alpha, K, H) || !mk_is_q8_0_rows(m.w_beta, K, H)) {
+        return false;
+    }
+    if (((uintptr_t) m.w_onorm->data | (uintptr_t) m.z->data | (uintptr_t) m.out->data) % 16 != 0) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_mk_gdn_run(ggml_backend_cuda_context & ctx, const ggml_cuda_mk_gdn & m) {
+    mk_gdn_params p;
+    char * scratch = ctx.mk_buf + MK_GDN_BASE;
+    p.s_copy        = (const int32_t *) m.s_copy->data;
+    p.conv_src      = (const float *) m.conv_src->data;
+    p.conv_src_row  = m.conv_src->nb[1] / sizeof(float);
+    p.conv_dst      = (float *) m.conv_dst->data;
+    p.qkv           = (const float *) m.qkv->data;
+    p.conv_w        = (const float *) m.conv_w->data;
+    p.state_src     = (const float *) m.state_src->data;
+    p.state_src_row = m.state_src->nb[1] / sizeof(float);
+    p.state_dst     = (float *) m.state_dst->data;
+    p.eps_q         = m.eps_q;
+    p.scale_q       = m.scale_q;
+    p.eps_k         = m.eps_k;
+    p.scale_k       = m.scale_k;
+    p.x             = (const float *) m.x->data;
+    p.K             = (int) m.x->ne[0];
+    p.w_alpha       = m.w_alpha->data;
+    p.alpha_bias    = (const float *) m.alpha_bias->data;
+    p.ssm_a         = (const float *) m.ssm_a->data;
+    p.w_beta        = m.w_beta->data;
+    p.w_stride_row  = m.w_alpha->nb[1] / ggml_type_size(GGML_TYPE_Q8_0);
+    p.gdn_scale     = 1.0f / sqrtf((float) MK_GDN_S);
+    p.z             = (const float *) m.z->data;
+    p.w_onorm       = (const float *) m.w_onorm->data;
+    p.eps_o         = m.eps_o;
+    p.out           = (float *) m.out->data;
+    p.attn          = (float *) (scratch + MK_GDN_OFF_ATTN);
+    p.out_s         = (float *) (scratch + MK_GDN_OFF_OUT);
+    p.cnt_v         = (uint32_t *) (scratch + MK_GDN_OFF_CNT);
+    p.cnt_k         = p.cnt_v + MK_GDN_MAX_H;
+    p.cnt_all       = p.cnt_k + MK_GDN_MAX_H;
+    p.H             = m.H;
+    p.HK            = m.HK;
+
+    const dim3 block_dims(MK_WARP_SIZE, MK_NWARPS, 1);
+    mk_gdn_kernel<<<m.H*MK_GDN_QUARTERS, block_dims, 0, ctx.stream()>>>(p);
+    CUDA_CHECK(cudaGetLastError());
 }

@@ -3874,6 +3874,190 @@ static int ggml_cuda_match_mk_hc_mix(const ggml_cgraph * cgraph, int i, ggml_cud
     return last;
 }
 
+// [ignite] qwen4exp gated delta net between the qkv/z and ssm_out matmuls (decode, one sequence, K = 1), in the order
+// the graph builds it; returns the index of the last node, 0 when the nodes differ in any way
+static int ggml_cuda_match_mk_gdn(const ggml_cgraph * cgraph, int i, ggml_cuda_mk_gdn & m) {
+    constexpr int N = 22;
+    int idx[N];
+    int n = 0;
+    for (int j = i; j < cgraph->n_nodes && n < N; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if ((t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return 0;
+        }
+        idx[n++] = j;
+    }
+    if (n < N) {
+        return 0;
+    }
+    const auto node = [&](int k) { return cgraph->nodes[idx[k]]; };
+    const auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+    const auto unary_is = [](const ggml_tensor * t, ggml_unary_op op) {
+        return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op;
+    };
+    // a view of `of` at byte offset `offs` (reshapes of it included)
+    const auto view_at = [&](const ggml_tensor * t, const ggml_tensor * of, size_t offs) {
+        return root(t) == of && (t->view_src ? t->view_offs : 0) == offs;
+    };
+
+    ggml_tensor * gr_c  = node(0);
+    ggml_tensor * cat   = node(1);
+    ggml_tensor * cpy_c = node(2);
+    ggml_tensor * gr_s  = node(3);
+    ggml_tensor * conv  = node(4);
+    ggml_tensor * silu  = node(5);
+    ggml_tensor * nq    = node(6);
+    ggml_tensor * sq    = node(7);
+    ggml_tensor * nk    = node(8);
+    ggml_tensor * sk    = node(9);
+    ggml_tensor * alpha = node(10);
+    ggml_tensor * ab    = node(11);
+    ggml_tensor * sp    = node(12);
+    ggml_tensor * ga    = node(13);
+    ggml_tensor * beta  = node(14);
+    ggml_tensor * bs    = node(15);
+    ggml_tensor * gdn   = node(16);
+    ggml_tensor * cpy_s = node(17);
+    ggml_tensor * no    = node(18);
+    ggml_tensor * nm    = node(19);
+    ggml_tensor * zs    = node(20);
+    ggml_tensor * out   = node(21);
+
+    if (gr_c->op != GGML_OP_GET_ROWS || gr_s->op != GGML_OP_GET_ROWS || gr_s->src[1] != gr_c->src[1] ||
+            gr_c->ne[1] != 1 || gr_s->ne[1] != 1) {
+        return 0;
+    }
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || ggml_get_op_params_i32(gdn, 0) != 1 || gdn->src[2]->ne[0] != 128 ||
+            gdn->src[2]->ne[2] != 1 || gdn->src[2]->ne[3] != 1 || gdn->src[3]->ne[0] != 1) {
+        return 0;
+    }
+    const int64_t S    = 128;
+    const int64_t H    = gdn->src[2]->ne[1];
+    const int64_t HK   = gdn->src[0]->ne[1];
+    const int64_t n_ch = 2*HK*S + H*S;
+
+    // conv state: concat(gathered row, qkv) along dim 0, its last 3 columns copied back into the cache
+    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || root(cat->src[0]) != gr_c ||
+            cat->ne[0] != 4 || cat->ne[1] != n_ch || cat->src[1]->ne[0] != 1) {
+        return 0;
+    }
+    const ggml_tensor * qkv = root(cat->src[1]);
+    if (qkv->op != GGML_OP_MUL_MAT || ggml_nelements(qkv) != n_ch) {
+        return 0;
+    }
+    if (cpy_c->op != GGML_OP_CPY || !view_at(cpy_c->src[0], cat, sizeof(float)) || cpy_c->src[1]->op != GGML_OP_VIEW ||
+            root(cpy_c->src[1]) != root(gr_c->src[0])) {
+        return 0;
+    }
+    if (conv->op != GGML_OP_SSM_CONV || conv->src[0] != cat || conv->src[1]->ne[0] != 4 || !unary_is(silu, GGML_UNARY_OP_SILU) ||
+            silu->src[0] != conv) {
+        return 0;
+    }
+    // q/k norms of the conv output, scaled (no bias)
+    if (nq->op != GGML_OP_RMS_NORM || !view_at(nq->src[0], silu, 0) || nq->src[0]->ne[0] != S || nq->src[0]->ne[1] != HK ||
+            nk->op != GGML_OP_RMS_NORM || !view_at(nk->src[0], silu, HK*S*sizeof(float)) || nk->src[0]->ne[0] != S ||
+            nk->src[0]->ne[1] != HK) {
+        return 0;
+    }
+    if (sq->op != GGML_OP_SCALE || sq->src[0] != nq || ggml_get_op_params_f32(sq, 1) != 0.0f ||
+            sk->op != GGML_OP_SCALE || sk->src[0] != nk || ggml_get_op_params_f32(sk, 1) != 0.0f) {
+        return 0;
+    }
+    // g = softplus(w_alpha*x + bias)*a, beta = sigmoid(w_beta*x)
+    if (alpha->op != GGML_OP_MUL_MAT || beta->op != GGML_OP_MUL_MAT || beta->src[1] != alpha->src[1] ||
+            alpha->src[1]->ne[1] != 1 || ab->op != GGML_OP_ADD || ab->src[0] != alpha || !unary_is(sp, GGML_UNARY_OP_SOFTPLUS) ||
+            root(sp->src[0]) != ab || ga->op != GGML_OP_MUL || ga->src[0] != sp || !unary_is(bs, GGML_UNARY_OP_SIGMOID) ||
+            root(bs->src[0]) != beta) {
+        return 0;
+    }
+    if (root(gdn->src[0]) != sq || root(gdn->src[1]) != sk || !view_at(gdn->src[2], silu, 2*HK*S*sizeof(float)) ||
+            root(gdn->src[3]) != ga || root(gdn->src[4]) != bs || root(gdn->src[5]) != gr_s ||
+            (gdn->src[5]->view_src && gdn->src[5]->view_offs != 0)) {
+        return 0;
+    }
+    // new state into the cache, then the gated output norm
+    if (cpy_s->op != GGML_OP_CPY || !view_at(cpy_s->src[0], gdn, S*H*sizeof(float)) || cpy_s->src[1]->op != GGML_OP_VIEW ||
+            root(cpy_s->src[1]) != root(gr_s->src[0])) {
+        return 0;
+    }
+    if (no->op != GGML_OP_RMS_NORM || !view_at(no->src[0], gdn, 0) || no->src[0]->ne[0] != S || no->src[0]->ne[1] != H ||
+            nm->op != GGML_OP_MUL || nm->src[0] != no || !unary_is(zs, GGML_UNARY_OP_SIGMOID) || out->op != GGML_OP_MUL ||
+            !((out->src[0] == nm && out->src[1] == zs) || (out->src[0] == zs && out->src[1] == nm))) {
+        return 0;
+    }
+    const ggml_tensor * z = root(zs->src[0]);
+    if (z->op != GGML_OP_MUL_MAT || ggml_nelements(z) != S*H) {
+        return 0;
+    }
+    for (const ggml_tensor * mm : { alpha, beta }) {
+        if (!ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
+            return 0;
+        }
+    }
+
+    m.s_copy     = gr_c->src[1];
+    m.conv_src   = gr_c->src[0];
+    m.conv_dst   = cpy_c->src[1];
+    m.qkv        = qkv;
+    m.conv_w     = conv->src[1];
+    m.state_src  = gr_s->src[0];
+    m.state_dst  = cpy_s->src[1];
+    m.eps_q      = ggml_get_op_params_f32(nq, 0);
+    m.scale_q    = ggml_get_op_params_f32(sq, 0);
+    m.eps_k      = ggml_get_op_params_f32(nk, 0);
+    m.scale_k    = ggml_get_op_params_f32(sk, 0);
+    m.x          = alpha->src[1];
+    m.w_alpha    = alpha->src[0];
+    m.alpha_bias = ab->src[1];
+    m.ssm_a      = ga->src[1];
+    m.w_beta     = beta->src[0];
+    m.z          = z;
+    m.w_onorm    = nm->src[1];
+    m.eps_o      = ggml_get_op_params_f32(no, 0);
+    m.out        = out;
+    m.H          = (int) H;
+    m.HK         = (int) HK;
+    if (!ggml_cuda_mk_gdn_supported(m)) {
+        return 0;
+    }
+
+    // only out and the caches are written: nothing after the segment may read the rest
+    const int last = idx[N - 1];
+    const ggml_tensor * internal[] = { gr_c, cat, gr_s, conv, silu, nq, sq, nk, sk, alpha, ab, sp, ga, beta, bs, gdn, no, nm, zs };
+    for (const ggml_tensor * t : internal) {
+        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+    }
+    for (int j = last + 1; j < cgraph->n_nodes; ++j) {
+        for (const ggml_tensor * src : cgraph->nodes[j]->src) {
+            if (!src) {
+                continue;
+            }
+            const ggml_tensor * r = root(src);
+            for (const ggml_tensor * t : internal) {
+                if (r == t) {
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // out is written after every read of the inputs (it may reuse qkv's memory), but not over a cache
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    if (overlap(m.out, m.conv_src) || overlap(m.out, m.state_src) || overlap(m.out, m.s_copy)) {
+        return 0;
+    }
+    return last;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -3889,6 +4073,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int last = ggml_cuda_match_mk_hc_mix(cgraph, i, m);
         if (last > 0) {
             ggml_cuda_mk_hc_mix_run(*cuda_ctx, m);
+            return last - i;
+        }
+    }
+
+    // [ignite] gated delta net segment as one launch
+    if (node->op == GGML_OP_GET_ROWS && cuda_ctx->mk_buf != nullptr && cuda_ctx->curr_stream_no == 0 &&
+            cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_mk_gdn_enabled()) {
+        ggml_cuda_mk_gdn m;
+        const int last = ggml_cuda_match_mk_gdn(cgraph, i, m);
+        if (last > 0) {
+            ggml_cuda_mk_gdn_run(*cuda_ctx, m);
             return last - i;
         }
     }
