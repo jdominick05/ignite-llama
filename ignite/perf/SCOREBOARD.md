@@ -225,3 +225,17 @@ dispatch gaps 24% (~3.8 us/kernel), waiting on the XT 48% (`gapsplit.py`).
   PPL +0.12% +- 0.43, d0 59.12/57.14 vs FN-R1 57.32/58.21 (no measurable gain). R2b = + gate/up_exps Q3_K: KLD 0.181,
   same top 87.8%, 99% KLD 2.13 (worse than the rejected Q2_K PLE table), not timed. fn-bench reps were noisy then;
   the first-rep warm-up fix (3a605a83f) came after.
+
+## Delivered decode: DFlash 2 vs ngram-mod vs none (2026-10-23, `fn-spec.sh`, serve_bench: 3 synthetic + 8 real agent requests 8k-20k prompt, temp 1.0 seed 42)
+
+FN-R1, `-c 32768 -ts 530,470`, `GGML_CUDA_MMVQ_MAX_BATCH=8`. DFlash = incoai Qwen3.8-Flash-Next-DFlash2 Q4_K_M on ROCm1
+(the output head's card), `--spec-draft-n-max 3`. Log: `fn-spec-20261023-185949/`.
+
+| config | agent replies only | all 11 | code | prose | rewrite |
+|---|---|---|---|---|---|
+| none | 41.0 | 43.1 | 42.1 | 44.5 | 45.0 |
+| ngram-mod, n-start 4 | 46.6 | 65.8 | 43.8 | 42.3 | **160.3** (89% accepted) |
+| **dflash, n 3** | **66.8** | **77.8** | 82.5 (75%) | 55.5 (39%) | 98.3 (99%) |
+
+DFlash accepted 52-81% of draft tokens on the agent replies (+63% over no drafter); ngram-mod still wins on output that
+repeats the context. Daily serving switched to DFlash at 262k (XTX 24.6 / XT 20.6 GB used after a 32k prompt).
