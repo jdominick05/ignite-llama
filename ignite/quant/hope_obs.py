@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # Tools around llama-hope-collect output (HOPE expert pruning, arXiv 2609.18916).
 #
-#   hope_obs.py convert OBS.bin OUT
-#       checks the collector's invariants and writes OUT.h5 (both sets summed) plus OUT-even.h5 / OUT-odd.h5 in the
-#       HDF5 layout of github.com/awslabs/HOPE (`hope calibrate`)
+#   hope_obs.py convert OBS.bin OUT [--sets 0,1,2,3] [--per-set]
+#       checks the collector's invariants and writes OUT.h5 (the chosen sets summed; default all) in the HDF5 layout
+#       of github.com/awslabs/HOPE (`hope calibrate`); --per-set also writes OUT-set<k>.h5. Prints how sparse the
+#       pair statistics are (share of co-selected pairs seen fewer than 50 times).
 #   hope_obs.py solve OBS.h5 --keep N [--method hope|reap|ean|man|freq] OUT.json --hope-src ~/src/HOPE
 #       runs awslabs' solver (hope/solve.py) or one of its baselines (hope/baselines.py) unchanged; OUT.json lists
 #       the experts to prune per layer
@@ -17,7 +18,7 @@ import argparse, importlib.util, json, os, sys
 
 import numpy as np
 
-MAGIC = b'HOPEOBS1'
+MAGIC = b'HOPEOBS2'
 VEC_KEYS = ('gate_sums', 'norm_sums', 'norm_square_sums', 'gate_norm_sums', 'gate_norm_square_sums')
 
 
@@ -26,7 +27,7 @@ def read_obs(path):
         if f.read(8) != MAGIC:
             sys.exit(f'{path}: not a hope-collect file')
         n_layer, n_expert, n_used, n_sets = np.frombuffer(f.read(16), dtype=np.int32)
-        n_chunks = int(np.frombuffer(f.read(8), dtype=np.int64)[0])
+        n_docs, n_tokens = (int(x) for x in np.frombuffer(f.read(16), dtype=np.int64))
         E = int(n_expert)
         sets = []
         for _ in range(n_sets):
@@ -41,11 +42,18 @@ def read_obs(path):
             sets.append(layers)
         if f.read(1):
             sys.exit(f'{path}: trailing bytes')
-    return dict(n_layer=int(n_layer), n_expert=E, n_used=int(n_used), n_chunks=n_chunks, sets=sets)
+    side = {}
+    if os.path.exists(path + '.json'):
+        side = json.load(open(path + '.json'))
+    return dict(n_layer=int(n_layer), n_expert=E, n_used=int(n_used), n_docs=n_docs, n_tokens=n_tokens, sets=sets, side=side)
 
 
 def check(layers, n_used, label):
     bad = 0
+    toks = {d['total_tokens'] for d in layers}
+    if len(toks) > 1:
+        bad += 1
+        print(f'{label}: layers saw different token counts {sorted(toks)[:4]}... (the last layer must run on all rows)')
     for il, d in enumerate(layers):
         n, C, F = d['total_tokens'], d['coselect_counts'], d['norm_prod_sums']
         errs = []
@@ -80,19 +88,29 @@ def write_h5(path, layers):
 
 def cmd_convert(a):
     o = read_obs(a.obs)
-    even, odd = o['sets']
-    total = [{k: (ev[k] + od[k]) for k in ev} for ev, od in zip(even, odd)]
-    bad = sum(check(s, o['n_used'], name) for s, name in ((even, 'even'), (odd, 'odd'), (total, 'sum')))
-    toks = [even[0]['total_tokens'], odd[0]['total_tokens']]
+    pick = [int(x) for x in a.sets.split(',')] if a.sets else list(range(len(o['sets'])))
+    chosen = [o['sets'][k] for k in pick]
+    total = [{k: sum(s[il][k] for s in chosen) for k in chosen[0][il]} for il in range(o['n_layer'])]
+    bad = sum(check(o['sets'][k], o['n_used'], f'set {k}') for k in pick) + check(total, o['n_used'], 'sum')
+    set_toks = [s[0]['total_tokens'] for s in o['sets']]
     live = [int((np.diag(d['coselect_counts']) > 0).sum()) for d in total]
-    print(f'{o["n_layer"]} layers, {o["n_expert"]} experts, top-{o["n_used"]}, {o["n_chunks"]} chunks, '
-          f'tokens even/odd {toks[0]}/{toks[1]}; experts never selected per layer: '
-          f'min {o["n_expert"] - max(live)} max {o["n_expert"] - min(live)}')
+    off = [d['coselect_counts'][~np.eye(o['n_expert'], dtype=bool)] for d in total]
+    seen = np.concatenate([x[x > 0] for x in off])
+    print(f'{o["n_layer"]} layers, {o["n_expert"]} experts, top-{o["n_used"]}, {o["n_docs"]} docs, {o["n_tokens"]} tokens; '
+          f'tokens per set {set_toks}, summing sets {pick}')
+    print(f'experts never selected per layer: min {o["n_expert"] - max(live)} max {o["n_expert"] - min(live)}; '
+          f'expert pairs never co-selected: {np.mean([(x == 0).mean() for x in off])*100:.1f}%; '
+          f'of co-selected pairs, seen < 50 times: {(seen < 50).mean()*100:.1f}%, median {int(np.median(seen))}')
+    if o['side'].get('src_tokens'):
+        st = o['side']['src_tokens']; n = sum(st.values())
+        print('tokens by source: ' + ', '.join(f'{k} {v/n*100:.1f}%' for k, v in sorted(st.items(), key=lambda x: -x[1])))
     if bad:
         sys.exit(f'{bad} layer checks failed, nothing written')
-    for suffix, s in (('', total), ('-even', even), ('-odd', odd)):
-        write_h5(a.out + suffix + '.h5', s)
-    print(f'wrote {a.out}.h5, {a.out}-even.h5, {a.out}-odd.h5')
+    write_h5(a.out + '.h5', total)
+    if a.per_set:
+        for k in pick:
+            write_h5(f'{a.out}-set{k}.h5', o['sets'][k])
+    print(f'wrote {a.out}.h5' + (' and per-set files' if a.per_set else ''))
 
 
 def load_module(src, name):
@@ -138,6 +156,7 @@ def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest='cmd', required=True)
     c = sub.add_parser('convert'); c.add_argument('obs'); c.add_argument('out')
+    c.add_argument('--sets', help='comma-separated set ids to sum (default all)'); c.add_argument('--per-set', action='store_true')
     s = sub.add_parser('solve'); s.add_argument('obs'); s.add_argument('out')
     s.add_argument('--keep', type=int, required=True)
     s.add_argument('--method', default='hope', choices=('hope', 'reap', 'ean', 'man', 'freq'))

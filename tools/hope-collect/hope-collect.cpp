@@ -8,16 +8,25 @@
 // of github.com/awslabs/HOPE (`hope calibrate`); ignite/quant/hope_obs.py converts this tool's output to it, so
 // `hope solve` runs unchanged.
 //
-// Statistics are kept in two sets by batch parity (even / odd batches), so the convergence check (solve each
-// half, compare the keep-sets) needs no second pass. The solver input is their sum.
+// Input (-f) is JSONL, one document per line: {"text": "...", "set": k, "src": "name"}. Text is tokenized with
+// special tokens parsed (chat-template markers are single tokens). A document longer than -c tokens is split into
+// pieces of at most -c tokens; pieces of one set are packed into batches of at most -b tokens, one sequence each.
+// Statistics are accumulated per set (--n-sets, default 4, e.g. half A/B x original/generated), so the convergence
+// check and the ablations need no second pass; the solver input is the sum of the chosen sets.
 //
-// Run it on the CPU backend (-dev none -ngl 0): fused or megakernel GPU paths may not expose the named tensors.
+// Only the last token of each piece is an output; the MTP hidden-state output (unmasked) keeps the last layer's
+// FFN running on all rows, so the logits buffer stays small.
+//
+// Check a GPU run against a CPU run (-dev none -ngl 0) on the same text: fused GPU paths must not hide the tensors.
 
 #include "llama.h"
 
 #include "arg.h"
 #include "common.h"
 #include "log.h"
+#include "../src/llama-ext.h"
+
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <clocale>
@@ -25,6 +34,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <string>
@@ -36,13 +47,13 @@
 
 static void print_usage(int, char ** argv) {
     LOG("\nexample usage:\n");
-    LOG("\n    %s -m model.gguf -f calib.txt -o hope-obs.bin -c 2048 -b 4096 -dev none -ngl 0 \\\n"
-        "       [--chunks N] [--output-frequency 10] [--in-file hope-obs.bin (resume)]\n", argv[0]);
+    LOG("\n    %s -m model.gguf -f pool.jsonl -o hope-obs.bin -c 16384 -b 4096 -dev none -ngl 0 \\\n"
+        "       [--n-sets 4] [--max-seqs 16] [--snapshot-every 500000] [--output-frequency 20] \\\n"
+        "       [--in-file hope-obs.bin (resume)]\n", argv[0]);
     LOG("\n");
 }
 
-static const char   HOPE_MAGIC[8] = { 'H', 'O', 'P', 'E', 'O', 'B', 'S', '1' };
-static const int    N_SETS        = 2;
+static const char   HOPE_MAGIC[8] = { 'H', 'O', 'P', 'E', 'O', 'B', 'S', '2' };
 
 struct layer_stats {
     int64_t              total_tokens = 0;
@@ -64,10 +75,12 @@ struct hope_collector {
     int32_t n_layer  = 0;
     int32_t n_expert = 0;
     int32_t n_used   = 0;
-    int64_t n_chunks_done = 0;   // chunks fully processed, for resuming
+    int64_t n_docs_done   = 0;   // documents fully processed, for resuming
+    int64_t n_tokens_done = 0;
     int     cur_set  = 0;        // set the running batch accumulates into
 
-    std::vector<layer_stats> sets[N_SETS]; // [set][layer]
+    std::vector<std::vector<layer_stats>> sets; // [set][layer]
+    std::map<std::string, int64_t> src_tokens;  // tokens per source, saved in the .json sidecar
 
     // final router weights of the current ubatch per layer, by priority of the name they were seen under
     struct weights_buf { int prio = -1; int64_t n_tokens = 0; std::vector<float> w; };
@@ -78,8 +91,9 @@ struct hope_collector {
     std::mutex mtx;
     std::vector<uint8_t> tmp;
 
-    void init(int32_t nl, int32_t ne, int32_t nu) {
+    void init(int32_t nl, int32_t ne, int32_t nu, int n_sets) {
         n_layer = nl; n_expert = ne; n_used = nu;
+        sets.resize(n_sets);
         for (auto & s : sets) {
             s.assign(nl, layer_stats());
             for (auto & l : s) { l.init(ne); }
@@ -202,10 +216,11 @@ struct hope_collector {
         const std::string tmp_path = path + ".tmp";
         FILE * f = fopen(tmp_path.c_str(), "wb");
         if (!f) { LOG_ERR("%s: cannot open %s\n", __func__, tmp_path.c_str()); return false; }
-        const int32_t hdr[4] = { n_layer, n_expert, n_used, N_SETS };
+        const int32_t hdr[4] = { n_layer, n_expert, n_used, (int32_t) sets.size() };
         fwrite(HOPE_MAGIC, 1, 8, f);
         fwrite(hdr, sizeof(hdr), 1, f);
-        fwrite(&n_chunks_done, sizeof(n_chunks_done), 1, f);
+        fwrite(&n_docs_done, sizeof(n_docs_done), 1, f);
+        fwrite(&n_tokens_done, sizeof(n_tokens_done), 1, f);
         for (const auto & s : sets) {
             for (const auto & l : s) {
                 fwrite(&l.total_tokens, sizeof(int64_t), 1, f);
@@ -221,6 +236,13 @@ struct hope_collector {
         if (!ok) { LOG_ERR("%s: write error on %s\n", __func__, tmp_path.c_str()); return false; }
         std::remove(path.c_str());
         if (std::rename(tmp_path.c_str(), path.c_str()) != 0) { LOG_ERR("%s: cannot rename to %s\n", __func__, path.c_str()); return false; }
+
+        nlohmann::json side = { { "docs_done", n_docs_done }, { "tokens_done", n_tokens_done }, { "src_tokens", src_tokens } };
+        std::vector<int64_t> set_tokens;
+        for (const auto & s : sets) { set_tokens.push_back(s.empty() ? 0 : s[0].total_tokens); }
+        side["set_tokens"] = set_tokens;
+        FILE * fj = fopen((path + ".json").c_str(), "wb");
+        if (fj) { const std::string js = side.dump(1); fwrite(js.data(), 1, js.size(), fj); fclose(fj); }
         return true;
     }
 
@@ -230,8 +252,8 @@ struct hope_collector {
         char magic[8];
         int32_t hdr[4];
         bool ok = fread(magic, 1, 8, f) == 8 && memcmp(magic, HOPE_MAGIC, 8) == 0 && fread(hdr, sizeof(hdr), 1, f) == 1;
-        ok = ok && hdr[0] == n_layer && hdr[1] == n_expert && hdr[2] == n_used && hdr[3] == N_SETS;
-        ok = ok && fread(&n_chunks_done, sizeof(n_chunks_done), 1, f) == 1;
+        ok = ok && hdr[0] == n_layer && hdr[1] == n_expert && hdr[2] == n_used && hdr[3] == (int32_t) sets.size();
+        ok = ok && fread(&n_docs_done, sizeof(n_docs_done), 1, f) == 1 && fread(&n_tokens_done, sizeof(n_tokens_done), 1, f) == 1;
         for (auto & s : sets) {
             for (auto & l : s) {
                 if (!ok) { break; }
@@ -244,8 +266,15 @@ struct hope_collector {
             }
         }
         fclose(f);
-        if (!ok) { LOG_ERR("%s: %s is not a matching hope-collect file\n", __func__, path.c_str()); }
-        return ok;
+        if (!ok) { LOG_ERR("%s: %s is not a matching hope-collect file\n", __func__, path.c_str()); return false; }
+        try {
+            std::ifstream fj(path + ".json");
+            const auto side = nlohmann::json::parse(fj);
+            src_tokens = side.at("src_tokens").get<std::map<std::string, int64_t>>();
+        } catch (const std::exception & e) {
+            LOG_WRN("%s: no usable sidecar %s.json (%s), per-source counts restart\n", __func__, path.c_str(), e.what());
+        }
+        return true;
     }
 };
 
@@ -265,74 +294,147 @@ static bool hope_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     return g_collector.collect(t, ask);
 }
 
-static bool run(llama_context * ctx, const common_params & params, int32_t n_ctx) {
-    const llama_model * model = llama_get_model(ctx);
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-    const bool add_bos = llama_vocab_get_add_bos(vocab);
+struct piece {
+    int64_t doc;   // index of the document it belongs to
+    bool    last;  // last piece of its document
+    std::vector<llama_token> toks;
+};
 
-    LOG_INF("%s: tokenizing the input ..\n", __func__);
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
-
-    const int64_t n_chunk_max = tokens.size() / n_ctx;
-    const int64_t n_chunk     = params.n_chunks < 0 ? n_chunk_max : std::min<int64_t>(params.n_chunks, n_chunk_max);
-    const int64_t first       = params.i_chunk > 0 ? params.i_chunk : g_collector.n_chunks_done;
-    const int     n_batch     = params.n_batch;
-    const int     n_seq       = std::max(1, n_batch / n_ctx);
-    const int     num_batches = (n_ctx + n_batch - 1) / n_batch;
-    GGML_ASSERT(n_batch < n_ctx || n_batch % n_ctx == 0);
-
-    if (first >= n_chunk) {
-        LOG_ERR("%s: nothing to do: start chunk %lld, %lld chunks of %d tokens in the input\n", __func__, (long long) first, (long long) n_chunk, n_ctx);
-        return false;
+// decodes pieces of one set: all in one batch, or one long piece over several batches
+static bool decode_pieces(llama_context * ctx, common_batch & batch, const std::vector<piece> & ps, int n_batch) {
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (ps.size() == 1 && (int) ps[0].toks.size() > n_batch) {
+        const auto & t = ps[0].toks;
+        for (size_t off = 0; off < t.size(); off += n_batch) {
+            batch.clear();
+            const size_t end = std::min(t.size(), off + n_batch);
+            for (size_t k = off; k < end; ++k) { batch.add(t[k], (llama_pos) k, 0, k + 1 == t.size()); }
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) { return false; }
+        }
+        return true;
     }
-    LOG_INF("%s: %zu tokens, chunks %lld..%lld of %d tokens, batch %d, %d sequences per batch\n",
-            __func__, tokens.size(), (long long) first, (long long) n_chunk - 1, n_ctx, n_batch, n_seq);
+    batch.clear();
+    for (size_t s = 0; s < ps.size(); ++s) {
+        const auto & t = ps[s].toks;
+        for (size_t k = 0; k < t.size(); ++k) { batch.add(t[k], (llama_pos) k, (llama_seq_id) s, k + 1 == t.size()); }
+    }
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+}
+
+static bool run(llama_context * ctx, const common_params & params, int32_t n_piece, int n_seq_max, int64_t snapshot_every) {
+    const int n_sets  = (int) g_collector.sets.size();
+    const int n_batch = params.n_batch;
+
+    std::vector<std::string> lines;
+    {
+        size_t pos = 0;
+        const std::string & in = params.prompt;
+        while (pos < in.size()) {
+            size_t nl = in.find('\n', pos);
+            if (nl == std::string::npos) { nl = in.size(); }
+            if (nl > pos) { lines.emplace_back(in, pos, nl - pos); }
+            pos = nl + 1;
+        }
+    }
+    const int64_t n_docs = (int64_t) lines.size();
+    LOG_INF("%s: %lld documents, resuming after %lld; pieces <= %d tokens, batches <= %d tokens / %d sequences\n", __func__,
+            (long long) n_docs, (long long) g_collector.n_docs_done, n_piece, n_batch, n_seq_max);
 
     common_batch batch(ctx);
+    std::vector<std::deque<piece>> queue(n_sets);
+    std::vector<int64_t> queued(n_sets, 0);
+    std::map<int64_t, int> open_pieces;   // doc -> pieces not decoded yet
+    int64_t next_snapshot = snapshot_every > 0 ? (g_collector.n_tokens_done / snapshot_every + 1) * snapshot_every : INT64_MAX;
+    int64_t n_iter = 0, t_run_tokens = 0;
     const auto t_run = std::chrono::steady_clock::now();
-    int64_t n_done_run = 0;
-    int     n_iter     = 0;
 
-    for (int64_t i = first; i < n_chunk; i += n_seq) {
-        const int n_seq_batch = (int) std::min<int64_t>(n_seq, n_chunk - i);
-        g_collector.cur_set = (int) ((i / n_seq) % N_SETS);
-
-        llama_memory_clear(llama_get_memory(ctx), true);
-
-        for (int j = 0; j < num_batches; ++j) {
-            const int64_t batch_start = i*n_ctx + (int64_t) j*n_batch;
-            const int     batch_size  = std::min<int>(n_ctx - j*n_batch, n_batch);
-
-            batch.clear();
-            for (int seq = 0; seq < n_seq_batch; seq++) {
-                const int64_t seq_start = batch_start + (int64_t) seq*n_ctx;
-                for (int k = 0; k < batch_size; ++k) {
-                    const llama_token tok = (add_bos && j == 0 && k == 0) ? llama_vocab_bos(vocab) : tokens[seq_start + k];
-                    // every token is an output: otherwise the last layer only runs its FFN for the output rows
-                    batch.add(tok, j*n_batch + k, seq, true);
-                }
-            }
-            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
-                LOG_ERR("%s: failed to eval\n", __func__);
-                return false;
-            }
+    // decodes the front of queue[s]: as many whole pieces as fit in one batch
+    auto flush_one = [&](int s) -> bool {
+        std::vector<piece> ps;
+        int64_t n = 0;
+        while (!queue[s].empty() && (int) ps.size() < n_seq_max &&
+               (ps.empty() || n + (int64_t) queue[s].front().toks.size() <= n_batch)) {
+            n += queue[s].front().toks.size();
+            ps.push_back(std::move(queue[s].front()));
+            queue[s].pop_front();
+            if (n >= n_batch) { break; }
         }
+        queued[s] -= n;
+        g_collector.cur_set = s;
+        if (!decode_pieces(ctx, batch, ps, n_batch)) { LOG_ERR("%s: failed to eval\n", __func__); return false; }
         llama_synchronize(ctx);
+        g_collector.n_tokens_done += n;
+        t_run_tokens += n;
+        for (const auto & p : ps) {
+            if (--open_pieces[p.doc] == 0) { open_pieces.erase(p.doc); }
+        }
+        // documents before the oldest one still open are complete
+        g_collector.n_docs_done = open_pieces.empty() ? g_collector.n_docs_done : open_pieces.begin()->first;
+        if (++n_iter % 10 == 0) {
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_run).count();
+            LOG_INF("%s: %lld tokens, doc %lld/%lld, %.1f tok/s, max |sum g - 1| = %.2e\n", __func__,
+                    (long long) g_collector.n_tokens_done, (long long) g_collector.n_docs_done, (long long) n_docs,
+                    t_run_tokens / secs, g_collector.max_gate_sum_err);
+        }
+        return true;
+    };
+    auto flush_all = [&]() -> bool {
+        for (int s = 0; s < n_sets; ++s) {
+            while (!queue[s].empty()) { if (!flush_one(s)) { return false; } }
+        }
+        return true;
+    };
+    auto save_points = [&](bool force) -> bool {
+        const bool snap = g_collector.n_tokens_done >= next_snapshot;
+        if (!snap && !force) { return true; }
+        if (!flush_all()) { return false; }
+        if (snap) {
+            const std::string p = params.out_file + "." + std::to_string(g_collector.n_tokens_done) + ".bin";
+            if (!g_collector.save(p)) { return false; }
+            LOG_INF("%s: snapshot %s\n", __func__, p.c_str());
+            while (next_snapshot <= g_collector.n_tokens_done) { next_snapshot += snapshot_every; }
+        }
+        return g_collector.save(params.out_file);
+    };
 
-        g_collector.n_chunks_done = i + n_seq_batch;
-        n_done_run += n_seq_batch;
-        ++n_iter;
+    for (int64_t d = g_collector.n_docs_done; d < n_docs; ++d) {
+        nlohmann::json doc;
+        try {
+            doc = nlohmann::json::parse(lines[d]);
+        } catch (const std::exception & e) {
+            LOG_ERR("%s: line %lld is not JSON: %s\n", __func__, (long long) d + 1, e.what());
+            return false;
+        }
+        const std::string text = doc.value("text", "");
+        const int set = doc.value("set", 0);
+        const std::string src = doc.value("src", "");
+        if (set < 0 || set >= n_sets) {
+            LOG_ERR("%s: line %lld has set %d, --n-sets is %d\n", __func__, (long long) d + 1, set, n_sets);
+            return false;
+        }
+        const std::vector<llama_token> toks = common_tokenize(ctx, text, false, /*parse_special*/ true);
+        if (toks.empty()) { continue; }
+        g_collector.src_tokens[src] += toks.size();
 
-        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_run).count();
-        const double tps  = n_done_run * n_ctx / secs;
-        LOG_INF("%s: chunk %lld/%lld, %.1f tok/s, ETA %.1f h, max |sum g - 1| = %.2e\n", __func__,
-                (long long) g_collector.n_chunks_done, (long long) n_chunk, tps,
-                (n_chunk - g_collector.n_chunks_done) * n_ctx / tps / 3600.0, g_collector.max_gate_sum_err);
+        int np = 0;
+        for (size_t off = 0; off < toks.size(); off += n_piece, ++np) {
+            const size_t end = std::min(toks.size(), off + n_piece);
+            queue[set].push_back({ d, end == toks.size(), std::vector<llama_token>(toks.begin() + off, toks.begin() + end) });
+            queued[set] += end - off;
+        }
+        open_pieces[d] = np;
 
-        if (params.n_out_freq > 0 && n_iter % params.n_out_freq == 0) {
-            if (!g_collector.save(params.out_file)) { return false; }
+        while (queued[set] >= n_batch) {
+            if (!flush_one(set)) { return false; }
+        }
+        if (!save_points(false)) { return false; }
+        if (params.n_out_freq > 0 && n_iter >= params.n_out_freq) {
+            n_iter = 0;
+            if (!save_points(true)) { return false; }
         }
     }
+    if (!flush_all()) { return false; }
+    g_collector.n_docs_done = n_docs;
     return true;
 }
 
@@ -346,21 +448,37 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_IMATRIX, print_usage)) {
+    // own options, removed before the common parser sees them
+    int     n_sets         = 4;
+    int     n_seq_max      = 16;
+    int64_t snapshot_every = 0;
+    std::vector<char *> args;
+    for (int i = 0; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (i + 1 < argc && (a == "--n-sets" || a == "--max-seqs" || a == "--snapshot-every")) {
+            const long long v = atoll(argv[++i]);
+            if (a == "--n-sets") { n_sets = (int) v; } else if (a == "--max-seqs") { n_seq_max = (int) v; } else { snapshot_every = v; }
+            continue;
+        }
+        args.push_back(argv[i]);
+    }
+    if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_IMATRIX, print_usage)) {
+        return 1;
+    }
+    if (n_sets < 1 || n_sets > 64 || n_seq_max < 1) {
+        LOG_ERR("%s: bad --n-sets / --max-seqs\n", __func__);
         return 1;
     }
 
-    const int32_t n_ctx = params.n_ctx;
-    if (n_ctx <= 0) {
+    const int32_t n_piece = params.n_ctx;  // -c: the longest piece a document is cut into
+    if (n_piece <= 0) {
         LOG_ERR("%s: requires '--ctx-size' > 0\n", __func__);
         return 1;
     }
-    {
-        const int32_t n_seq = std::max(1, params.n_batch / n_ctx);
-        params.n_parallel = n_seq;
-        params.n_ctx      = n_seq * n_ctx;
-        params.n_batch    = std::min(params.n_batch, params.n_ctx);
-    }
+    params.n_parallel = n_seq_max;
+    params.kv_unified = true;
+    params.n_ctx      = std::max(n_piece, params.n_batch);
+    params.n_batch    = std::min(params.n_batch, params.n_ctx);
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -384,20 +502,23 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: not a MoE model (expert_count %d, expert_used_count %d)\n", __func__, n_expert, n_used);
         return 1;
     }
-    g_collector.init(n_layer, n_expert, n_used);
+    g_collector.init(n_layer, n_expert, n_used, n_sets);
+    // unmasked MTP rows: the last layer runs its FFN on every row although only one token per piece is an output
+    llama_set_embeddings_nextn(ctx, true, /*masked*/ false);
     LOG_INF("%s: %d layers, %d experts, %d used per token\n", __func__, n_layer, n_expert, n_used);
 
     for (const auto & in_file : params.in_files) {
         if (!g_collector.load(in_file)) { return 1; }
-        LOG_INF("%s: resuming from %s after %lld chunks\n", __func__, in_file.c_str(), (long long) g_collector.n_chunks_done);
+        LOG_INF("%s: resuming from %s after %lld documents (%lld tokens)\n", __func__, in_file.c_str(),
+                (long long) g_collector.n_docs_done, (long long) g_collector.n_tokens_done);
     }
 
     LOG_INF("\n%s\n", common_params_get_system_info(params).c_str());
 
-    if (!run(ctx, params, n_ctx)) { return 1; }
+    if (!run(ctx, params, n_piece, n_seq_max, snapshot_every)) { return 1; }
     if (!g_collector.save(params.out_file)) { return 1; }
-    LOG_INF("%s: saved %s (%lld chunks, %lld layer-token observations)\n", __func__, params.out_file.c_str(),
-            (long long) g_collector.n_chunks_done, (long long) g_collector.n_obs);
+    LOG_INF("%s: saved %s (%lld documents, %lld tokens, %lld layer-token observations)\n", __func__, params.out_file.c_str(),
+            (long long) g_collector.n_docs_done, (long long) g_collector.n_tokens_done, (long long) g_collector.n_obs);
 
     llama_perf_context_print(ctx);
     llama_backend_free();
