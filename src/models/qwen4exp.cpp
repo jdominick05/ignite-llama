@@ -377,6 +377,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     return mixed;
 }
 
+ggml_tensor * llama_model_qwen4exp::graph::build_hc_mean(ggml_tensor * x) const {
+    const int64_t hc = x->ne[1];
+
+    ggml_tensor * acc = ggml_view_2d(ctx0, x, x->ne[0], x->ne[2], x->nb[2], 0);
+    for (int64_t s = 1; s < hc; ++s) {
+        acc = ggml_add(ctx0, acc, ggml_view_2d(ctx0, x, x->ne[0], x->ne[2], x->nb[2], s*x->nb[1]));
+    }
+    return ggml_scale(ctx0, acc, 1.0f/hc);
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
         ggml_tensor * residual,
         ggml_tensor * block_out,
@@ -458,7 +468,12 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, res_hc);
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = res_hc;
+        // DFlash drafters take the mean over the hc streams (the raw residual, as the drafter was trained)
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = build_hc_mean(res_hc);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
 
         if (hparams.is_ple(il)) {
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
