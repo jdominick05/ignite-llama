@@ -7,7 +7,11 @@
 #       pair statistics are (share of co-selected pairs seen fewer than 50 times).
 #   hope_obs.py solve OBS.h5 --keep N [--method hope|reap|ean|man|freq] OUT.json --hope-src ~/src/HOPE
 #       runs awslabs' solver (hope/solve.py) or one of its baselines (hope/baselines.py) unchanged; OUT.json lists
-#       the experts to prune per layer
+#       the experts to prune per layer. --jobs N (hope only) solves N layers at once, one BLAS thread each, with the
+#       same per-layer QP and the same OUT.json / OUT.json.log.json; the serial solver threads BLAS inside one layer,
+#       which scales poorly at 512 experts
+#   hope_obs.py merge A.bin B.bin OUT.bin
+#       adds two collector files of the same model and set count (e.g. a cloud part and a local-only part)
 #   hope_obs.py compare A.json B.json [--map MAP.json]
 #       per-layer overlap of the kept sets; --map translates A's expert ids (e.g. a REAP-288 obs) into B's space
 #       with the per-layer index map written by expmap.py
@@ -46,6 +50,41 @@ def read_obs(path):
     if os.path.exists(path + '.json'):
         side = json.load(open(path + '.json'))
     return dict(n_layer=int(n_layer), n_expert=E, n_used=int(n_used), n_docs=n_docs, n_tokens=n_tokens, sets=sets, side=side)
+
+
+def write_obs(path, o):
+    with open(path, 'wb') as f:
+        f.write(MAGIC)
+        f.write(np.array([o['n_layer'], o['n_expert'], o['n_used'], len(o['sets'])], dtype=np.int32).tobytes())
+        f.write(np.array([o['n_docs'], o['n_tokens']], dtype=np.int64).tobytes())
+        for layers in o['sets']:
+            for d in layers:
+                f.write(np.array([d['total_tokens']], dtype=np.int64).tobytes())
+                f.write(np.ascontiguousarray(d['norm_prod_sums'], dtype=np.float64).tobytes())
+                f.write(np.ascontiguousarray(d['coselect_counts'], dtype=np.int64).tobytes())
+                for k in VEC_KEYS:
+                    f.write(np.ascontiguousarray(d[k], dtype=np.float64).tobytes())
+    side = dict(o.get('side') or {})
+    side['set_tokens'] = [layers[0]['total_tokens'] for layers in o['sets']]
+    json.dump(side, open(path + '.json', 'w'), indent=1)
+
+
+def cmd_merge(a):
+    A, B = read_obs(a.a), read_obs(a.b)
+    for k in ('n_layer', 'n_expert', 'n_used'):
+        if A[k] != B[k]:
+            sys.exit(f'{k} differs: {A[k]} vs {B[k]}')
+    if len(A['sets']) != len(B['sets']):
+        sys.exit('set counts differ')
+    sets = [[{k: A['sets'][s][l][k] + B['sets'][s][l][k] for k in A['sets'][s][l]} for l in range(A['n_layer'])]
+            for s in range(len(A['sets']))]
+    src = dict(A['side'].get('src_tokens', {}))
+    for k, v in B['side'].get('src_tokens', {}).items():
+        src[k] = src.get(k, 0) + v
+    o = dict(A, sets=sets, n_docs=A['n_docs'] + B['n_docs'], n_tokens=A['n_tokens'] + B['n_tokens'],
+             side={'src_tokens': src, 'merged_from': [a.a, a.b]})
+    write_obs(a.out, o)
+    print(f'wrote {a.out}: {o["n_tokens"]} tokens ({A["n_tokens"]} + {B["n_tokens"]})')
 
 
 def check(layers, n_used, label):
@@ -120,6 +159,43 @@ def load_module(src, name):
     return m
 
 
+def _solve_layer(job):
+    obs, src, il, num_prune = job
+    import time, h5py
+    m = load_module(src, 'solve')
+    t0 = time.time()
+    with h5py.File(obs, 'r') as f:
+        matrix = m.build_f_matrix(f, il)
+    b_bin, b_cont, obj_bin, obj_cont = m.solve_qp(matrix, num_prune)
+    return il, np.where(b_bin > 0.5)[0].tolist(), float(obj_bin), float(obj_cont), b_cont.tolist(), time.time() - t0
+
+
+def solve_parallel(obs, out, src, num_prune, jobs):
+    import h5py, multiprocessing as mp
+    with h5py.File(obs, 'r') as f:
+        n_layer = len([k for k in f.keys() if k.startswith('layer_') and '-' not in k])
+        n_expert = f['layer_0']['norm_prod_sums'].shape[0]
+    print(f'Pruning {num_prune}/{n_expert} experts per layer across {n_layer} layers, {jobs} layers at a time', flush=True)
+    for v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
+        os.environ[v] = '1'  # inherited by the spawned workers before they import numpy
+    pruneset, log = {}, {'obs_path': obs, 'prune_frac': None, 'prune_num': num_prune, 'num_layers': n_layer,
+                         'num_experts': n_expert, 'layers': {}}
+    with mp.get_context('spawn').Pool(jobs) as pool:
+        for i, (il, pruned, ob, oc, bc, dt) in enumerate(pool.imap_unordered(
+                _solve_layer, [(obs, src, il, num_prune) for il in range(n_layer)])):
+            pruneset[str(il)] = pruned
+            log['layers'][str(il)] = {'num_experts': n_expert, 'num_pruned': len(pruned), 'pruned_experts': pruned,
+                                      'bin_objective_val': ob, 'cont_objective_val': oc, 'cont_solution': bc}
+            print(f'  layer {il}: {dt:.0f} s, obj_bin={ob:.6e} ({i + 1}/{n_layer} done)', flush=True)
+    pruneset = {str(il): pruneset[str(il)] for il in range(n_layer)}
+    log['layers'] = {str(il): log['layers'][str(il)] for il in range(n_layer)}
+    with open(out, 'w') as f:
+        json.dump(pruneset, f, indent=2)
+    with open(out + '.log.json', 'w') as f:
+        json.dump(log, f, indent=2)
+    print(f'Pruning set saved to {out}')
+
+
 def cmd_solve(a):
     import h5py
     with h5py.File(a.obs, 'r') as f:
@@ -127,7 +203,9 @@ def cmd_solve(a):
     if not 0 < a.keep < E:
         sys.exit(f'--keep must be in 1..{E - 1}')
     src = os.path.expanduser(a.hope_src)
-    if a.method == 'hope':
+    if a.method == 'hope' and a.jobs > 1:
+        solve_parallel(a.obs, a.out, src, E - a.keep, a.jobs)
+    elif a.method == 'hope':
         load_module(src, 'solve').solve(a.obs, a.out, prune_num=E - a.keep)
     else:
         load_module(src, 'baselines').solve_baselines(a.obs, a.out, a.method, prune_num=E - a.keep)
@@ -161,11 +239,13 @@ def main():
     s.add_argument('--keep', type=int, required=True)
     s.add_argument('--method', default='hope', choices=('hope', 'reap', 'ean', 'man', 'freq'))
     s.add_argument('--hope-src', default='~/src/HOPE')
+    s.add_argument('--jobs', type=int, default=1)
+    g = sub.add_parser('merge'); g.add_argument('a'); g.add_argument('b'); g.add_argument('out')
     m = sub.add_parser('compare'); m.add_argument('a'); m.add_argument('b')
     m.add_argument('--experts-a', type=int, required=True); m.add_argument('--experts-b', type=int, required=True)
     m.add_argument('--map')
     a = p.parse_args()
-    {'convert': cmd_convert, 'solve': cmd_solve, 'compare': cmd_compare}[a.cmd](a)
+    {'convert': cmd_convert, 'solve': cmd_solve, 'merge': cmd_merge, 'compare': cmd_compare}[a.cmd](a)
 
 
 if __name__ == '__main__':

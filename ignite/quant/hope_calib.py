@@ -369,7 +369,8 @@ def src_oai(cfg, rng, render):
         if not any(m['role'] == 'user' for m in msgs) or not any(m['role'] == 'assistant' for m in msgs):
             continue
         g, k = _gk(cfg, row, i)
-        yield dict(group=g, key=k, msgs=msgs, kind='chat')
+        tools = row.get(cfg['tools']) if cfg.get('tools') else None
+        yield dict(group=g, key=k, msgs=msgs, kind='chat', tools=tools or None, gen=int(bool(row.get('_gen'))))
 
 
 def src_react(cfg, rng, render):
@@ -671,7 +672,7 @@ def main():
             h = half_of[key]
             half_chars[h] += len(text)
             text = text.encode('utf-8', 'replace').decode('utf-8')   # lone surrogates from some datasets
-            docs.append({'text': text, 'set': 2 * h + gen, 'src': name})
+            docs.append({'text': text, 'set': 2 * h + gen, 'src': name, 'key': str(key)})
         per_src[name] = docs
         top = max(per_group.values()) if per_group else 0
         set_chars = Counter()
