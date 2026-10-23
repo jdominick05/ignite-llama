@@ -66,7 +66,7 @@ def main():
                 plan.append((t, keep[il]))
             else:
                 # a tensor with an expert-sized axis that the pattern misses would be copied unsliced and break loading
-                if n_expert in t.data.shape[:1] and re.match(r'^blk\.\d+\.', t.name):
+                if n_expert in t.data.shape[:1] and re.match(r'^blk\.\d+\.(ffn|exp)', t.name):
                     sys.exit(f'{t.name}: first axis is {n_expert} (experts?) but the tensor is not in the slice list')
                 plan.append((t, None))
     sliced = [t.name for t, k in plan if k is not None]
