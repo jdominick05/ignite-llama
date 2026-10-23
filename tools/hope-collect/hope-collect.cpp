@@ -17,6 +17,10 @@
 // Only the last token of each piece is an output; the MTP hidden-state output (unmasked) keeps the last layer's
 // FFN running on all rows, so the logits buffer stays small.
 //
+// Expert output norms come from a node the context adds to the graph (llama_set_moe_stats: ffn_moe_down_norm2), so
+// only [n_used, n_tokens] floats per layer reach the host; --cpu-norms copies the full outputs and computes them on the
+// host instead, --check-norms does both and reports the largest relative difference.
+//
 // Check a GPU run against a CPU run (-dev none -ngl 0) on the same text: fused GPU paths must not hide the tensors.
 
 #include "llama.h"
@@ -39,6 +43,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -48,7 +53,7 @@
 static void print_usage(int, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n    %s -m model.gguf -f pool.jsonl -o hope-obs.bin -c 16384 -b 4096 -dev none -ngl 0 \\\n"
-        "       [--n-sets 4] [--max-seqs 16] [--snapshot-every 500000] [--output-frequency 20] \\\n"
+        "       [--n-sets 4] [--max-seqs 16] [--snapshot-every 500000] [--output-frequency 20] [--stat-threads N] [--cpu-norms | --check-norms] \\\n"
         "       [--in-file hope-obs.bin (resume)]\n", argv[0]);
     LOG("\n");
 }
@@ -78,6 +83,7 @@ struct hope_collector {
     int64_t n_docs_done   = 0;   // documents fully processed, for resuming
     int64_t n_tokens_done = 0;
     int     cur_set  = 0;        // set the running batch accumulates into
+    int     n_threads = 1;       // threads for the expert-output norms (the callback holds up the graph meanwhile)
 
     std::vector<std::vector<layer_stats>> sets; // [set][layer]
     std::map<std::string, int64_t> src_tokens;  // tokens per source, saved in the .json sidecar
@@ -127,14 +133,105 @@ struct hope_collector {
         return -1;
     }
 
+    // the selected experts of the current ubatch per layer: [n_tokens][n_used]
+    struct ids_buf { int64_t n_tokens = 0; std::vector<int32_t> ids; };
+    std::map<int, ids_buf> topk;
+    std::map<int, std::vector<double>> cpu_norms;   // --check-norms: norms computed on the host, per layer
+
+    bool   gpu_norms   = true;    // norms from the graph's ffn_moe_down_norm2 (llama_set_moe_stats), not the outputs
+    bool   check_norms = false;   // also compute them on the host and compare
+    double max_norm_rel_err = 0.0;
+
     static bool is_down(const ggml_tensor * t, int & il) {
         return t->op == GGML_OP_MUL_MAT_ID && (parse(t->name, "ffn_moe_down", il) || parse(t->name, "ffn_moe_down_scaled", il));
+    }
+
+    // [n_used, n_tokens] I32 with any strides -> [n_tokens][n_used]
+    std::vector<int32_t> read_ids(const ggml_tensor * ids) {
+        const uint8_t * p = data_of(ids);
+        std::vector<int32_t> v(ids->ne[0]*ids->ne[1]);
+        for (int64_t i = 0; i < ids->ne[1]; ++i) {
+            for (int64_t k = 0; k < ids->ne[0]; ++k) {
+                v[i*ids->ne[0] + k] = *(const int32_t *) (p + k*ids->nb[0] + i*ids->nb[1]);
+            }
+        }
+        return v;
+    }
+
+    // norms of the expert outputs [n_embd, n_used, n_tokens], tokens split over threads; each norm is summed in the
+    // same order whatever the thread count
+    std::vector<double> host_norms(const ggml_tensor * t) {
+        const uint8_t * out = data_of(t);
+        const int64_t n_embd = t->ne[0], nt = t->ne[2];
+        std::vector<double> norms(nt*n_used);
+        auto rows = [&](int64_t i0, int64_t i1) {
+            for (int64_t i = i0; i < i1; ++i) {
+                for (int k = 0; k < n_used; ++k) {
+                    const float * f = (const float *) (out + k*t->nb[1] + i*t->nb[2]);
+                    double s = 0.0;
+                    for (int64_t d = 0; d < n_embd; ++d) { s += (double) f[d] * f[d]; }
+                    norms[i*n_used + k] = sqrt(s);
+                }
+            }
+        };
+        const int nth = (int) std::max<int64_t>(1, std::min<int64_t>(n_threads, nt / 16));
+        std::vector<std::thread> workers;
+        const int64_t step = (nt + nth - 1) / nth;
+        for (int th = 1; th < nth; ++th) {
+            workers.emplace_back(rows, std::min(nt, th*step), std::min(nt, (th + 1)*step));
+        }
+        rows(0, std::min(nt, step));
+        for (auto & wk : workers) { wk.join(); }
+        return norms;
+    }
+
+    std::vector<float> take_weights(int il, int64_t nt) {
+        auto it = weights.find(il);
+        GGML_ASSERT(it != weights.end() && it->second.n_tokens == nt && "router weights not seen before the expert outputs");
+        std::vector<float> w = std::move(it->second.w);
+        weights.erase(it);
+        return w;
+    }
+
+    void accumulate(int il, int64_t nt, const std::vector<int32_t> & ids, const std::vector<float> & w, const std::vector<double> & norms) {
+        layer_stats & ls = sets[cur_set][il];
+        ls.total_tokens += nt;
+        const int64_t E = n_expert;
+        std::vector<double> g(n_used);
+        for (int64_t i = 0; i < nt; ++i) {
+            const int32_t * e   = ids.data()   + i*n_used;
+            const double  * nrm = norms.data() + i*n_used;
+            double gsum = 0.0;
+            for (int k = 0; k < n_used; ++k) {
+                GGML_ASSERT(e[k] >= 0 && e[k] < n_expert);
+                g[k] = w[i*n_used + k];
+                gsum += g[k];
+            }
+            max_gate_sum_err = std::max(max_gate_sum_err, fabs(gsum - 1.0));
+            for (int a = 0; a < n_used; ++a) {
+                const double ga = g[a], na = nrm[a];
+                ls.gate_sums[e[a]]             += ga;
+                ls.norm_sums[e[a]]             += na;
+                ls.norm_square_sums[e[a]]      += na*na;
+                ls.gate_norm_sums[e[a]]        += ga*na;
+                ls.gate_norm_square_sums[e[a]] += ga*ga*na*na;
+                for (int b = 0; b < n_used; ++b) {
+                    ls.norm_prod_sums [e[a]*E + e[b]] += ga*na*g[b]*nrm[b];
+                    ls.coselect_counts[e[a]*E + e[b]] += 1;
+                }
+            }
+        }
+        n_obs += nt;
     }
 
     bool collect(ggml_tensor * t, bool ask) {
         int il = -1;
         if (ask) {
-            return weights_prio(t->name, il) >= 0 || is_down(t, il);
+            if (weights_prio(t->name, il) >= 0) { return true; }
+            if (gpu_norms) {
+                return parse(t->name, "ffn_moe_topk", il) || parse(t->name, "ffn_moe_down_norm2", il) || (check_norms && is_down(t, il));
+            }
+            return is_down(t, il);
         }
 
         std::lock_guard<std::mutex> lock(mtx);
@@ -154,61 +251,55 @@ struct hope_collector {
             return true;
         }
 
-        if (!is_down(t, il)) { return true; }
-        GGML_ASSERT(il >= 0 && il < n_layer);
-
-        // experts: [n_embd, n_used, n_tokens], ids (src[2]): [n_used, n_tokens] I32
-        const ggml_tensor * ids = t->src[2];
-        GGML_ASSERT(t->type == GGML_TYPE_F32 && ids && ids->type == GGML_TYPE_I32);
-        GGML_ASSERT(t->ne[1] == n_used && ids->ne[0] == n_used && ids->ne[1] == t->ne[2]);
-        const int64_t n_embd = t->ne[0];
-        const int64_t nt     = t->ne[2];
-
-        auto it = weights.find(il);
-        GGML_ASSERT(it != weights.end() && it->second.n_tokens == nt && "router weights not seen before the expert outputs");
-        const std::vector<float> w = std::move(it->second.w);
-        weights.erase(it);
-
-        std::vector<uint8_t> ids_copy;
-        {
-            const uint8_t * p = data_of(ids);
-            ids_copy.assign(p, p + ggml_nbytes(ids));
+        if (gpu_norms && parse(t->name, "ffn_moe_topk", il)) {
+            GGML_ASSERT(t->type == GGML_TYPE_I32 && t->ne[0] == n_used);
+            topk[il] = { t->ne[1], read_ids(t) };
+            return true;
         }
-        const uint8_t * out = data_of(t);
 
-        layer_stats & ls = sets[cur_set][il];
-        ls.total_tokens += nt;
-        const int64_t E = n_expert;
-        std::vector<int32_t> e(n_used);
-        std::vector<double>  g(n_used), nrm(n_used);
-
-        for (int64_t i = 0; i < nt; ++i) {
-            double gsum = 0.0;
-            for (int k = 0; k < n_used; ++k) {
-                e[k] = *(const int32_t *) (ids_copy.data() + k*ids->nb[0] + i*ids->nb[1]);
-                GGML_ASSERT(e[k] >= 0 && e[k] < n_expert);
-                g[k] = w[i*n_used + k];
-                gsum += g[k];
-                const float * f = (const float *) (out + k*t->nb[1] + i*t->nb[2]);
-                double s = 0.0;
-                for (int64_t d = 0; d < n_embd; ++d) { s += (double) f[d] * f[d]; }
-                nrm[k] = sqrt(s);
+        if (is_down(t, il)) {
+            GGML_ASSERT(il >= 0 && il < n_layer);
+            // experts: [n_embd, n_used, n_tokens], ids (src[2]): [n_used, n_tokens] I32
+            const ggml_tensor * ids = t->src[2];
+            GGML_ASSERT(t->type == GGML_TYPE_F32 && ids && ids->type == GGML_TYPE_I32);
+            GGML_ASSERT(t->ne[1] == n_used && ids->ne[0] == n_used && ids->ne[1] == t->ne[2]);
+            if (gpu_norms) {   // --check-norms
+                cpu_norms[il] = host_norms(t);
+                return true;
             }
-            max_gate_sum_err = std::max(max_gate_sum_err, fabs(gsum - 1.0));
-            for (int a = 0; a < n_used; ++a) {
-                const double ga = g[a], na = nrm[a];
-                ls.gate_sums[e[a]]             += ga;
-                ls.norm_sums[e[a]]             += na;
-                ls.norm_square_sums[e[a]]      += na*na;
-                ls.gate_norm_sums[e[a]]        += ga*na;
-                ls.gate_norm_square_sums[e[a]] += ga*ga*na*na;
-                for (int b = 0; b < n_used; ++b) {
-                    ls.norm_prod_sums [e[a]*E + e[b]] += ga*na*g[b]*nrm[b];
-                    ls.coselect_counts[e[a]*E + e[b]] += 1;
+            const int64_t nt = t->ne[2];
+            const std::vector<int32_t> e = read_ids(ids);
+            const std::vector<float>   w = take_weights(il, nt);
+            accumulate(il, nt, e, w, host_norms(t));
+            return true;
+        }
+
+        if (gpu_norms && parse(t->name, "ffn_moe_down_norm2", il)) {
+            GGML_ASSERT(il >= 0 && il < n_layer);
+            GGML_ASSERT(t->type == GGML_TYPE_F32 && t->ne[0] == 1 && t->ne[1] == n_used);
+            const int64_t nt = t->ne[2];
+            auto it = topk.find(il);
+            GGML_ASSERT(it != topk.end() && it->second.n_tokens == nt && "selected experts not seen before the expert norms");
+            const std::vector<int32_t> e = std::move(it->second.ids);
+            topk.erase(it);
+            const std::vector<float> w = take_weights(il, nt);
+            const uint8_t * p = data_of(t);
+            std::vector<double> norms(nt*n_used);
+            for (int64_t i = 0; i < nt; ++i) {
+                for (int k = 0; k < n_used; ++k) {
+                    norms[i*n_used + k] = sqrt((double) std::max(0.0f, *(const float *) (p + k*t->nb[1] + i*t->nb[2])));
                 }
             }
+            if (check_norms) {
+                auto c = cpu_norms.find(il);
+                GGML_ASSERT(c != cpu_norms.end() && c->second.size() == norms.size());
+                for (size_t j = 0; j < norms.size(); ++j) {
+                    max_norm_rel_err = std::max(max_norm_rel_err, fabs(norms[j] - c->second[j]) / std::max(c->second[j], 1e-6));
+                }
+                cpu_norms.erase(c);
+            }
+            accumulate(il, nt, e, w, norms);
         }
-        n_obs += nt;
         return true;
     }
 
@@ -452,12 +543,18 @@ int main(int argc, char ** argv) {
     int     n_sets         = 4;
     int     n_seq_max      = 16;
     int64_t snapshot_every = 0;
+    int     stat_threads   = (int) std::max(1u, std::thread::hardware_concurrency());
+    bool    cpu_norms_opt  = false;
+    bool    check_norms    = false;
     std::vector<char *> args;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
-        if (i + 1 < argc && (a == "--n-sets" || a == "--max-seqs" || a == "--snapshot-every")) {
+        if (a == "--cpu-norms")   { cpu_norms_opt = true; continue; }
+        if (a == "--check-norms") { check_norms   = true; continue; }
+        if (i + 1 < argc && (a == "--n-sets" || a == "--max-seqs" || a == "--snapshot-every" || a == "--stat-threads")) {
             const long long v = atoll(argv[++i]);
-            if (a == "--n-sets") { n_sets = (int) v; } else if (a == "--max-seqs") { n_seq_max = (int) v; } else { snapshot_every = v; }
+            if (a == "--n-sets") { n_sets = (int) v; } else if (a == "--max-seqs") { n_seq_max = (int) v; }
+            else if (a == "--stat-threads") { stat_threads = (int) std::max(1LL, v); } else { snapshot_every = v; }
             continue;
         }
         args.push_back(argv[i]);
@@ -503,6 +600,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
     g_collector.init(n_layer, n_expert, n_used, n_sets);
+    g_collector.n_threads   = stat_threads;
+    g_collector.gpu_norms   = !cpu_norms_opt;
+    g_collector.check_norms = check_norms && !cpu_norms_opt;
+    llama_set_moe_stats(ctx, g_collector.gpu_norms);
     // unmasked MTP rows: the last layer runs its FFN on every row although only one token per piece is an output
     llama_set_embeddings_nextn(ctx, true, /*masked*/ false);
     LOG_INF("%s: %d layers, %d experts, %d used per token\n", __func__, n_layer, n_expert, n_used);
@@ -520,6 +621,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: saved %s (%lld documents, %lld tokens, %lld layer-token observations)\n", __func__, params.out_file.c_str(),
             (long long) g_collector.n_docs_done, (long long) g_collector.n_tokens_done, (long long) g_collector.n_obs);
 
+    if (g_collector.check_norms) {
+        LOG_INF("%s: graph vs host expert norms: max relative difference %.3g\n", __func__, g_collector.max_norm_rel_err);
+    }
     llama_perf_context_print(ctx);
     llama_backend_free();
     return 0;
