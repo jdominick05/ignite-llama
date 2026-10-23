@@ -103,6 +103,10 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Add the squared L2 norm of every selected expert's output to MoE graphs, as "ffn_moe_down_norm2-<il>"
+// ([1, n_expert_used, n_tokens], F32), so expert statistics need not copy the outputs to the host (llama-hope-collect)
+LLAMA_API void llama_set_moe_stats(struct llama_context * ctx, bool value);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

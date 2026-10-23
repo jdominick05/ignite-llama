@@ -2476,6 +2476,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_scaled", il);
     }
 
+    if (cparams.moe_stats) {
+        ggml_tensor * norm2 = ggml_sum_rows(ctx0, ggml_sqr(ctx0, experts)); // [1, n_expert_used, n_tokens]
+        cb(norm2, "ffn_moe_down_norm2", il);
+        ggml_build_forward_expand(gf, norm2);
+    }
+
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
