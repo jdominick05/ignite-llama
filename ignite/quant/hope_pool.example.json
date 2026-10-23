@@ -1,0 +1,337 @@
+{
+ "sources": [
+  {
+   "name": "sessions",
+   "type": "sessions",
+   "path": "~/.qwen/projects",
+   "share": 9,
+   "group_cap": 0.3
+  },
+  {
+   "name": "swe-hero",
+   "type": "oai",
+   "files": "~/llm/hope/data/swe-hero/data/*.parquet",
+   "messages": "trajectory",
+   "group": "repo",
+   "key": "instance_id",
+   "share": 5,
+   "group_cap": 0.03
+  },
+  {
+   "name": "multi-swe",
+   "type": "oai",
+   "files": "~/llm/hope/data/multi-swe-trajs/extracted/**/*.json",
+   "messages": "fncall_messages",
+   "final": "fncall_response.choices.0.message",
+   "group_re": "extracted/([^/]+)/",
+   "share": 4,
+   "group_cap": 0.2
+  },
+  {
+   "name": "terminal-devops",
+   "type": "oai",
+   "files": [
+    "~/llm/hope/data/nemotron-terminal/synthetic_tasks/skill_based/*/debugging/*.parquet",
+    "~/llm/hope/data/nemotron-terminal/synthetic_tasks/skill_based/*/system_administration/*.parquet"
+   ],
+   "messages": "conversations",
+   "key": "task",
+   "group_re": "skill_based/([^/]+/[^/]+)/",
+   "share": 4
+  },
+  {
+   "name": "terminaltraj",
+   "type": "oai",
+   "files": "~/llm/hope/data/terminaltraj/data/*.parquet",
+   "messages": "messages",
+   "share": 1.5
+  },
+  {
+   "name": "toolace",
+   "type": "oai",
+   "files": "~/llm/hope/data/toolace/data.json",
+   "messages": "conversations",
+   "system": "system",
+   "share": 1.5
+  },
+  {
+   "name": "terminal-security",
+   "type": "oai",
+   "files": "~/llm/hope/data/nemotron-terminal/synthetic_tasks/skill_based/*/security/*.parquet",
+   "messages": "conversations",
+   "key": "task",
+   "group_re": "skill_based/([^/]+)/",
+   "share": 10
+  },
+  {
+   "name": "pentest-react",
+   "type": "react",
+   "files": "~/llm/hope/data/sec-agentic-sft/*_trajectories.jsonl",
+   "group": "benchmark",
+   "key": "trajectory_id",
+   "share": 3
+  },
+  {
+   "name": "privesc",
+   "type": "oai",
+   "files": "~/llm/hope/data/privesc-llm/paper_sft_dataset/**/traces.jsonl",
+   "messages": "messages",
+   "keep_system": true,
+   "group": "scenario",
+   "key": "run_id",
+   "share": 6,
+   "group_cap": 0.15
+  },
+  {
+   "name": "soc-agent",
+   "type": "oai",
+   "files": "~/llm/hope/data/soc-agent-traces/**/*.parquet",
+   "messages": "trace",
+   "keep_system": true,
+   "share": 6
+  },
+  {
+   "name": "hackerone",
+   "type": "text",
+   "files": "~/llm/hope/data/hackerone-reports/data/*.parquet",
+   "columns": [
+    "title",
+    "vulnerability_information"
+   ],
+   "share": 3
+  },
+  {
+   "name": "ctftime",
+   "type": "ctftime",
+   "files": "~/llm/hope/data/ctftime/data/*.parquet",
+   "share": 2.5
+  },
+  {
+   "name": "stackexchange",
+   "type": "text",
+   "files": "~/llm/hope/data/stackexchange-sec/**/*.parquet",
+   "columns": [
+    "ThreadText"
+   ],
+   "group_re": "stackexchange-sec/([^/]+)/",
+   "share": 3,
+   "group_cap": 0.45
+  },
+  {
+   "name": "secqa",
+   "type": "pairs",
+   "files": "~/llm/hope/data/trendyol-sec/*.jsonl",
+   "prompt": "user",
+   "reply": "assistant",
+   "per_doc": 4,
+   "share": 1.5,
+   "unescape": true
+  },
+  {
+   "name": "cvefixes",
+   "type": "text",
+   "files": "~/llm/hope/data/cvefixes/data/*.parquet",
+   "columns": [
+    "cve_id",
+    "cve_description",
+    "cwe_name",
+    "commit_message",
+    "diff_with_context"
+   ],
+   "group": "language",
+   "share": 1.5,
+   "group_cap": 0.3,
+   "max_doc_tokens": 8000
+  },
+  {
+   "name": "circl",
+   "type": "text",
+   "files": "~/llm/hope/data/circl-*/data/*.parquet",
+   "columns": [
+    "title",
+    "description",
+    "techniques",
+    "patches"
+   ],
+   "share": 1
+  },
+  {
+   "name": "sigmaforge",
+   "type": "text",
+   "files": "~/llm/hope/data/sigmaforge/description_to_sigma/*.parquet",
+   "columns": [
+    "title",
+    "description",
+    "sigma_rule",
+    "splunk_spl",
+    "sentinel_kql",
+    "elastic_lucene"
+   ],
+   "share": 1
+  },
+  {
+   "name": "detection-repos",
+   "type": "code",
+   "docs": true,
+   "trees": [
+    "~/llm/hope/code/sigma",
+    "~/llm/hope/code/detection-rules",
+    "~/llm/hope/code/yara-rules",
+    "~/llm/hope/code/mitre-cti",
+    "~/llm/hope/code/PayloadsAllTheThings"
+   ],
+   "share": 1.5,
+   "group_cap": 0.3
+  },
+  {
+   "name": "terraform-sec",
+   "type": "text",
+   "files": "~/llm/hope/data/terraform-sec/data/*.jsonl",
+   "columns": [
+    "instruction",
+    "input",
+    "output"
+   ],
+   "share": 0.5
+  },
+  {
+   "name": "decompile",
+   "type": "pairs",
+   "files": "~/llm/hope/data/decompile-ghidra/data/*.parquet",
+   "prompt": "instruction",
+   "reply": "output",
+   "per_doc": 10,
+   "share": 2
+  },
+  {
+   "name": "objdump",
+   "type": "files",
+   "files": "~/llm/hope/data/objdump/*.txt",
+   "share": 1.5,
+   "max_doc_tokens": 3000,
+   "max_pieces_per_key": 2
+  },
+  {
+   "name": "malware-src",
+   "type": "files",
+   "files": "~/llm/hope/data/malware-vx-decompiled/**/*",
+   "group_re": "malware-vx-decompiled/([^/]+)/",
+   "max_file_chars": 300000,
+   "share": 1.5,
+   "group_cap": 0.6,
+   "max_doc_tokens": 3000,
+   "max_pieces_per_key": 2
+  },
+  {
+   "name": "cape-reports",
+   "type": "files",
+   "files": "~/llm/hope/data/malware-cape-reports/**/filtered_reports/*.json",
+   "group_re": "malware-cape-reports/([^/]+)/",
+   "share": 1,
+   "group_cap": 0.6,
+   "max_doc_tokens": 3000,
+   "max_pieces_per_key": 2
+  },
+  {
+   "name": "sleigh",
+   "type": "code",
+   "trees": [
+    "~/src/ghidra/Ghidra/Processors"
+   ],
+   "share": 1
+  },
+  {
+   "name": "code",
+   "type": "code",
+   "trees": [
+    "~/llm/hope/code/linux",
+    "~/llm/hope/code/openssl",
+    "~/llm/hope/code/rizin",
+    "~/llm/hope/code/nmap",
+    "~/llm/hope/code/impacket",
+    "~/llm/hope/code/pwntools",
+    "~/llm/hope/code/metasploit-framework",
+    "~/llm/hope/code/go",
+    "~/llm/hope/code/curl",
+    "~/llm/hope/code/juice-shop",
+    "~/llm/hope/code/DVWA",
+    "~/llm/hope/code/PowerShell",
+    "~/llm/hope/code/sqlmap",
+    "~/llm/hope/code/laravel-framework",
+    "~/llm/hope/code/openzeppelin-contracts",
+    "~/llm/hope/code/swift-nio",
+    "~/llm/hope/code/nowinandroid",
+    "~/llm/hope/code/excalidraw",
+    "~/llm/hope/code/terraform-aws-eks",
+    "~/llm/hope/code/helm-charts",
+    "~/llm/hope/code/kubernetes-examples",
+    "~/llm/hope/code/jellyfin",
+    "~/src/ghidra",
+    "~/src/ALVR/alvr",
+    "~/src/btop",
+    "~/src/hashcat",
+    "~/src/qwen-code/packages/core/src",
+    "~/miniforge3/lib/python3.14"
+   ],
+   "share": 15,
+   "group_cap": 0.1
+  },
+  {
+   "name": "osint",
+   "type": "code",
+   "docs": true,
+   "trees": [
+    "~/llm/hope/osint/lockfale_OSINT-Framework",
+    "~/llm/hope/osint/jivoi_awesome-osint",
+    "~/llm/hope/osint/sherlock-project_sherlock",
+    "~/llm/hope/osint/laramies_theHarvester",
+    "~/llm/hope/osint/smicallef_spiderfoot",
+    "~/llm/hope/osint/lanmaster53_recon-ng",
+    "~/llm/hope/osint/soxoj_maigret",
+    "~/llm/hope/osint/owasp-amass_amass",
+    "~/llm/hope/osint/projectdiscovery_subfinder",
+    "~/llm/hope/osint/projectdiscovery_httpx",
+    "~/llm/hope/osint/projectdiscovery_nuclei-templates",
+    "~/llm/hope/osint/megadose_holehe",
+    "~/llm/hope/osint/sundowndev_phoneinfoga",
+    "~/llm/hope/osint/mxrch_GHunt",
+    "~/llm/hope/osint/s0md3v_Photon",
+    "~/llm/hope/osint/trufflesecurity_trufflehog",
+    "~/llm/hope/osint/OWASP_wstg"
+   ],
+   "file_chars": 12000,
+   "share": 5,
+   "group_cap": 0.2
+  },
+  {
+   "name": "math",
+   "type": "oai",
+   "files": "~/llm/hope/data/openr1-math/data/*.parquet",
+   "messages": "messages",
+   "share": 3
+  },
+  {
+   "name": "chat",
+   "type": "oai",
+   "files": "~/llm/hope/data/ultrachat/data/*.parquet",
+   "messages": "messages",
+   "share": 3
+  },
+  {
+   "name": "multilingual",
+   "type": "pairs",
+   "files": "~/llm/hope/data/aya/data/train-*.parquet",
+   "prompt": "inputs",
+   "reply": "targets",
+   "where_not": {
+    "language_code": [
+     "eng"
+    ]
+   },
+   "group": "language_code",
+   "per_doc": 20,
+   "share": 2,
+   "group_cap": 0.05
+  }
+ ]
+}

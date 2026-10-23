@@ -1,0 +1,13 @@
+{"sources": [
+ {"name": "secqa", "files": "~/llm/hope/data/trendyol-sec/*.jsonl", "template": "{user}", "tokens": 180000},
+ {"name": "stackexchange", "files": "~/llm/hope/data/stackexchange-sec/**/*.parquet", "template": "{Title}\n\n{Body}", "tokens": 250000},
+ {"name": "hackerone", "files": "~/llm/hope/data/hackerone-reports/data/*.parquet", "template": "Here is a disclosed bug bounty report. Explain the vulnerability, its root cause and impact, how you would verify it, and how it should be fixed.\n\n# {title}\n\n{vulnerability_information}", "tokens": 200000, "max_prompt_chars": 16000},
+ {"name": "ctftime", "files": "~/llm/hope/data/ctftime/data/*.parquet", "template": "Below is part of a CTF writeup. Explain the technique it relies on, then describe step by step how you would approach a similar challenge, including the commands you would run.\n\n{text_chunk}", "tokens": 150000, "min_chars": 400},
+ {"name": "sigma", "files": "~/llm/hope/data/sigmaforge/description_to_sigma/*.parquet", "template": "Write a Sigma detection rule (YAML) for the following, then give the equivalent Splunk SPL query and note likely false positives.\n\nTitle: {title}\nDescription: {description}", "tokens": 100000},
+ {"name": "cvefixes", "files": "~/llm/hope/data/cvefixes/data/*.parquet", "template": "Review this {language} code for security vulnerabilities. Identify the bug and its CWE class, explain how it could be exploited, and give a fixed version.\n\n```\n{vulnerable_code}\n```", "tokens": 150000, "max_prompt_chars": 12000},
+ {"name": "circl", "files": "~/llm/hope/data/circl-attack-techniques/data/*.parquet", "template": "Which MITRE ATT&CK techniques could an attacker use to exploit this vulnerability, and how would a defender detect and mitigate it?\n\n{title}\n{description}", "tokens": 60000},
+ {"name": "decompile", "files": "~/llm/hope/data/decompile-ghidra/data/*.parquet", "template": "{instruction}", "tokens": 100000},
+ {"name": "math", "files": "~/llm/hope/data/openr1-math/data/*.parquet", "template": "{problem}", "tokens": 120000},
+ {"name": "chat", "files": "~/llm/hope/data/ultrachat/data/*.parquet", "template": "{prompt}", "tokens": 120000},
+ {"name": "multilingual", "files": "~/llm/hope/data/aya/data/train-*.parquet", "template": "{inputs}", "where_not": {"language_code": ["eng"]}, "tokens": 70000}
+]}
