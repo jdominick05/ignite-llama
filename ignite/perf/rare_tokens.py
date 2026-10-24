@@ -16,7 +16,7 @@ Prompts are synthetic and generated from a fixed seed, so every model sees the s
 pruned model can lose a string without garbling it: refused (refusal phrasing in the reply), cut off (max_tokens hit,
 usually while thinking) or omitted; per-template exact rates show prompts that trigger refusals.
 """
-import argparse, base64, json, os, random, re, string, sys, time, urllib.request
+import argparse, gzip, threading, base64, json, os, random, re, string, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 
@@ -109,11 +109,14 @@ def main():
     ap.add_argument('--port', type=int, default=8092)
     ap.add_argument('--prompts', type=int, default=32)
     ap.add_argument('--seeds', type=int, default=8)
+    ap.add_argument('--seed-start', type=int, default=0, help='first seed (to continue a probe run without repeats)')
     ap.add_argument('--max-tokens', type=int, default=400)
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--progress', type=int, default=100, help='print the running score every N samples (0 = off)')
     ap.add_argument('--key-file', default=os.path.expanduser('~/llm/fn-server.keys'))
     ap.add_argument('--out', default=os.path.expanduser('~/llm/logs/rare-tokens.jsonl'))
+    ap.add_argument('--dump', help='also write every sample (prompt ids, generated ids, top logprobs) to this .jsonl.gz')
+    ap.add_argument('--top-logprobs', type=int, default=32, help='with --dump: top-k raw logprobs per generated token')
     a = ap.parse_args()
     key = open(a.key_file).readline().strip() if os.path.exists(a.key_file) else ''
     stats = defaultdict(lambda: [0, 0, 0])   # kind -> exact, near, miss
@@ -121,21 +124,37 @@ def main():
     causes = defaultdict(int)                # miss cause -> count
     t0 = time.time()
 
+    def post(path, body):
+        req = urllib.request.Request(f'http://127.0.0.1:{a.port}{path}', data=json.dumps(body).encode(),
+                                     headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {key}'})
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return json.load(r)
+
+    dump = gzip.open(a.dump, 'at') if a.dump else None
+    dump_lock = threading.Lock()
+
     def one(job):
         (k, s, ti, prompt), seed = job
         body = {'messages': [{'role': 'user', 'content': prompt}], 'max_tokens': a.max_tokens, 'seed': seed,
                 'reasoning_effort': 'low', **SAMPLING}
-        req = urllib.request.Request(f'http://127.0.0.1:{a.port}/v1/chat/completions', data=json.dumps(body).encode(),
-                                     headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {key}'})
-        with urllib.request.urlopen(req, timeout=600) as r:
-            c = json.load(r)['choices'][0]
+        if dump: body.update(logprobs=True, top_logprobs=a.top_logprobs)   # raw softmax (post_sampling_probs off)
+        c = post('/v1/chat/completions', body)['choices'][0]
         text = c['message'].get('content') or ''
         res = 0 if s in text else 1 if edit_distance_window(s, text) <= 3 else 2
         cause = None if res < 2 else 'cut_off' if c.get('finish_reason') == 'length' else \
             'refused' if REFUSAL.search(text) else 'omitted'
+        if dump:
+            tpl = post('/apply-template', {k2: body[k2] for k2 in ('messages', 'reasoning_effort')})['prompt']
+            ids = post('/tokenize', {'content': tpl, 'add_special': False, 'parse_special': True})['tokens']
+            lp = c['logprobs']['content']
+            rec = {'kind': k, 'tpl': ti, 'seed': seed, 'res': res, 'cause': cause, 'finish': c.get('finish_reason'),
+                   'prompt_ids': ids, 'gen_ids': [t['id'] for t in lp], 'gen_lp': [round(t['logprob'], 4) for t in lp],
+                   'top_ids': [[u['id'] for u in t['top_logprobs']] for t in lp],
+                   'top_lp': [[round(u['logprob'], 4) for u in t['top_logprobs']] for t in lp]}
+            with dump_lock: dump.write(json.dumps(rec) + '\n')
         return k, ti, res, cause
 
-    jobs = [(p, seed) for p in make_prompts(a.prompts) for seed in range(a.seeds)]
+    jobs = [(p, seed) for p in make_prompts(a.prompts) for seed in range(a.seed_start, a.seed_start + a.seeds)]
     with ThreadPoolExecutor(a.jobs) as ex:
         for i, (k, ti, res, cause) in enumerate(ex.map(one, jobs), 1):
             stats[k][res] += 1
@@ -146,6 +165,7 @@ def main():
                 ex_n = sum(v[0] for v in stats.values()); dt = time.time() - t0
                 print(f'{a.label}: {i}/{len(jobs)} done, exact so far {ex_n / i * 100:.1f}%, '
                       f'{dt:.0f} s, ETA {dt / i * (len(jobs) - i):.0f} s', file=sys.stderr, flush=True)
+    if dump: dump.close()
     tot = [sum(v[i] for v in stats.values()) for i in range(3)]
     n = sum(tot)
     row = {'label': a.label, 'prompts': a.prompts, 'seeds': a.seeds, 'exact': tot[0] / n, 'near_miss': tot[1] / n,
