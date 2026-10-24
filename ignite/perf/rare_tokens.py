@@ -12,13 +12,16 @@ seeds at the daily settings (temp 1.0, top-k 20, top-p 0.95) and scores exact co
 --jobs N sends N requests at once (start the server with -np N).
 
 Prompts are synthetic and generated from a fixed seed, so every model sees the same set. Prints exact / near-miss
-(edit distance 1-3, i.e. a garbled copy) / missing rates per string kind and overall.
+(edit distance 1-3, i.e. a garbled copy) / missing rates per string kind and overall. Misses are split by cause, since a
+pruned model can lose a string without garbling it: refused (refusal phrasing in the reply), cut off (max_tokens hit,
+usually while thinking) or omitted; per-template exact rates show prompts that trigger refusals.
 """
-import argparse, base64, json, os, random, string, sys, time, urllib.request
+import argparse, base64, json, os, random, re, string, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 
 SAMPLING = dict(temperature=1.0, top_k=20, top_p=0.95, min_p=0.0)
+REFUSAL = re.compile(r"\b(I can(no|')t|I('m| am) (not able|unable)|I won't|I will not|I don't have access)\b", re.IGNORECASE)
 
 
 def hexs(r, n):
@@ -65,8 +68,8 @@ def make_prompts(n, seed=1234):
     for i in range(n):
         k = kinds[i % len(kinds)]
         s = KINDS[k](r)
-        t = TEMPLATES[(i // len(kinds)) % len(TEMPLATES)]
-        out.append((k, s, t.format(s=s, n=r.randint(1000, 9999), ts=f'2026-10-{r.randint(10, 28)}T{r.randint(0, 23):02d}:{r.randint(0, 59):02d}Z')))
+        ti = (i // len(kinds)) % len(TEMPLATES); t = TEMPLATES[ti]
+        out.append((k, s, ti, t.format(s=s, n=r.randint(1000, 9999), ts=f'2026-10-{r.randint(10, 28)}T{r.randint(0, 23):02d}:{r.randint(0, 59):02d}Z')))
     return out
 
 
@@ -114,22 +117,30 @@ def main():
     a = ap.parse_args()
     key = open(a.key_file).readline().strip() if os.path.exists(a.key_file) else ''
     stats = defaultdict(lambda: [0, 0, 0])   # kind -> exact, near, miss
+    by_tpl = defaultdict(lambda: [0, 0])     # template index -> exact, total
+    causes = defaultdict(int)                # miss cause -> count
     t0 = time.time()
 
     def one(job):
-        (k, s, prompt), seed = job
+        (k, s, ti, prompt), seed = job
         body = {'messages': [{'role': 'user', 'content': prompt}], 'max_tokens': a.max_tokens, 'seed': seed,
                 'reasoning_effort': 'low', **SAMPLING}
         req = urllib.request.Request(f'http://127.0.0.1:{a.port}/v1/chat/completions', data=json.dumps(body).encode(),
                                      headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {key}'})
         with urllib.request.urlopen(req, timeout=600) as r:
-            text = json.load(r)['choices'][0]['message'].get('content') or ''
-        return k, 0 if s in text else 1 if edit_distance_window(s, text) <= 3 else 2
+            c = json.load(r)['choices'][0]
+        text = c['message'].get('content') or ''
+        res = 0 if s in text else 1 if edit_distance_window(s, text) <= 3 else 2
+        cause = None if res < 2 else 'cut_off' if c.get('finish_reason') == 'length' else \
+            'refused' if REFUSAL.search(text) else 'omitted'
+        return k, ti, res, cause
 
     jobs = [(p, seed) for p in make_prompts(a.prompts) for seed in range(a.seeds)]
     with ThreadPoolExecutor(a.jobs) as ex:
-        for i, (k, res) in enumerate(ex.map(one, jobs), 1):
+        for i, (k, ti, res, cause) in enumerate(ex.map(one, jobs), 1):
             stats[k][res] += 1
+            by_tpl[ti][0] += res == 0; by_tpl[ti][1] += 1
+            if cause: causes[cause] += 1
             if a.progress and (i % a.progress == 0) and i < len(jobs):
                 # running score on stderr, so a pipe that keeps only the final line still shows it
                 ex_n = sum(v[0] for v in stats.values()); dt = time.time() - t0
@@ -138,11 +149,14 @@ def main():
     tot = [sum(v[i] for v in stats.values()) for i in range(3)]
     n = sum(tot)
     row = {'label': a.label, 'prompts': a.prompts, 'seeds': a.seeds, 'exact': tot[0] / n, 'near_miss': tot[1] / n,
-           'missing': tot[2] / n, 'per_kind': {k: v for k, v in stats.items()}, 'seconds': round(time.time() - t0)}
+           'missing': tot[2] / n, 'per_kind': {k: v for k, v in stats.items()}, 'miss_causes': dict(causes),
+           'per_template': {str(t): v for t, v in sorted(by_tpl.items())}, 'seconds': round(time.time() - t0)}
     with open(a.out, 'a') as f:
         f.write(json.dumps(row) + '\n')
     print(f'{a.label}: exact {tot[0] / n * 100:.1f}%  garbled {tot[1] / n * 100:.1f}%  missing {tot[2] / n * 100:.1f}%  '
           f'({n} samples, {row["seconds"]} s)')
+    print('  misses: ' + ', '.join(f'{c} {n}' for c, n in sorted(causes.items())) + '   exact per template: ' +
+          ', '.join(f'T{t} {v[0]}/{v[1]}' for t, v in sorted(by_tpl.items())))
     for k, v in sorted(stats.items()):
         m = sum(v)
         print(f'  {k:7s} exact {v[0]}/{m}  garbled {v[1]}  missing {v[2]}')
