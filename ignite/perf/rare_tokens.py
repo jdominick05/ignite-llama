@@ -14,7 +14,7 @@ seeds at the daily settings (temp 1.0, top-k 20, top-p 0.95) and scores exact co
 Prompts are synthetic and generated from a fixed seed, so every model sees the same set. Prints exact / near-miss
 (edit distance 1-3, i.e. a garbled copy) / missing rates per string kind and overall.
 """
-import argparse, base64, json, os, random, string, time, urllib.request
+import argparse, base64, json, os, random, string, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 
@@ -108,6 +108,7 @@ def main():
     ap.add_argument('--seeds', type=int, default=8)
     ap.add_argument('--max-tokens', type=int, default=400)
     ap.add_argument('--jobs', type=int, default=4)
+    ap.add_argument('--progress', type=int, default=100, help='print the running score every N samples (0 = off)')
     ap.add_argument('--key-file', default=os.path.expanduser('~/llm/fn-server.keys'))
     ap.add_argument('--out', default=os.path.expanduser('~/llm/logs/rare-tokens.jsonl'))
     a = ap.parse_args()
@@ -127,8 +128,13 @@ def main():
 
     jobs = [(p, seed) for p in make_prompts(a.prompts) for seed in range(a.seeds)]
     with ThreadPoolExecutor(a.jobs) as ex:
-        for k, res in ex.map(one, jobs):
+        for i, (k, res) in enumerate(ex.map(one, jobs), 1):
             stats[k][res] += 1
+            if a.progress and (i % a.progress == 0) and i < len(jobs):
+                # running score on stderr, so a pipe that keeps only the final line still shows it
+                ex_n = sum(v[0] for v in stats.values()); dt = time.time() - t0
+                print(f'{a.label}: {i}/{len(jobs)} done, exact so far {ex_n / i * 100:.1f}%, '
+                      f'{dt:.0f} s, ETA {dt / i * (len(jobs) - i):.0f} s', file=sys.stderr, flush=True)
     tot = [sum(v[i] for v in stats.values()) for i in range(3)]
     n = sum(tot)
     row = {'label': a.label, 'prompts': a.prompts, 'seeds': a.seeds, 'exact': tot[0] / n, 'near_miss': tot[1] / n,
