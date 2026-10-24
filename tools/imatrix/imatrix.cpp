@@ -8,6 +8,7 @@
 #include "log.h"
 #include "speculative.h"
 
+#include <algorithm>
 #include <chrono>
 #include <climits>
 #include <clocale>
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <regex>
 #include <set>
 #include <thread>
 #include <unordered_map>
@@ -69,7 +71,15 @@ struct tensor_statistics {
 class IMatrixCollector {
 public:
     IMatrixCollector() = default;
-    void set_params(common_params params) { m_params = std::move(params); }
+    void set_params(common_params params) {
+        m_params = std::move(params);
+        // LLAMA_IMATRIX_SKIP=<regex>: tensors to leave out, e.g. ones the quant recipe keeps at Q8_0 or wider (those
+        // types ignore the imatrix); saves the copy and the graph split for each of them
+        if (const char * skip = getenv("LLAMA_IMATRIX_SKIP"); skip && *skip) {
+            m_skip = std::regex(skip);
+            m_has_skip = true;
+        }
+    }
     bool collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data);
     void save_imatrix_legacy(int32_t ncall = -1) const;
     void save_imatrix(int32_t n_chunk = -1) const;
@@ -77,6 +87,7 @@ public:
     const std::unordered_map<std::string, Stats> & get_mstats() const { return m_stats; }
     void set_n_layer_nextn(int32_t n_layer_nextn) { m_n_layer_nextn = n_layer_nextn; }
     int32_t get_n_layer_nextn() const { return m_n_layer_nextn; }
+    void print_timings() const;
 private:
     std::unordered_map<std::string, Stats>  m_stats;
     common_params                           m_params;
@@ -87,6 +98,26 @@ private:
     int32_t                                 m_n_layer_nextn = 0;
     std::vector<char>                       m_src1_data;
     std::vector<char>                       m_ids; // the expert ids from ggml_mul_mat_id
+    std::regex                              m_skip;
+    bool                                    m_has_skip = false;
+    // pinned host staging buffers, one per device, for the src1 copies (pageable copies are slow)
+    std::unordered_map<ggml_backend_dev_t, ggml_backend_buffer_t> m_pinned;
+    // routed rows grouped by expert, in the order the serial loop visits them
+    std::vector<int64_t>                    m_ex_off;
+    std::vector<int64_t>                    m_ex_rows;
+    // time spent in the callback: copies, accumulation, everything else (saves, checks)
+    double                                  m_t_copy = 0.0, m_t_acc = 0.0, m_t_total = 0.0;
+    int64_t                                 m_n_calls = 0, m_bytes = 0, m_bytes_reused = 0;
+    // the last staged src1 and ids. Consecutive matmuls often read the same input (attn q/k/v, ffn gate/up); the
+    // tensor is live until its last consumer has run, so between two of its consumers its data cannot change
+    const ggml_tensor *                     m_last_src1 = nullptr;
+    const void *                            m_last_src1_data = nullptr;
+    const char *                            m_last_staged = nullptr;
+    const ggml_tensor *                     m_last_ids = nullptr;
+    const void *                            m_last_ids_data = nullptr;
+    const ggml_tensor *                     m_grouped_src1 = nullptr; // m_ex_off/m_ex_rows were built for m_last_ids + this src1
+    std::unordered_map<std::string, double> m_copy_by_kind; // copy seconds per tensor kind (name without blk.N.)
+    const char * stage_src1(const ggml_tensor * src1);
     int32_t e_chunk_size() const {
         return m_chunk_size > 0 ? m_chunk_size : m_params.n_ctx / m_params.n_parallel;
     }
@@ -570,6 +601,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
     // when ask is true, the scheduler wants to know if we are interested in data from this tensor
     // if we return true, a follow-up call will be made with ask=false in which we can do the actual collection
     if (ask) {
+        if (m_has_skip && std::regex_search(wname, m_skip)) { return false; }
         if (t->op == GGML_OP_MUL_MAT_ID) { return true; } // collect all indirect matrix multiplications
         if (t->op != GGML_OP_MUL_MAT) { return false; }
         // why are small batches ignored (<16 tokens)?
@@ -583,17 +615,22 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
     std::lock_guard<std::mutex> lock(m_mutex);
 
+    using clk = std::chrono::steady_clock;
+    const auto t_start = clk::now();
+    struct timing_guard {
+        IMatrixCollector * c; clk::time_point t0;
+        ~timing_guard() { c->m_t_total += std::chrono::duration<double>(clk::now() - t0).count(); c->m_n_calls++; }
+    } tg { this, t_start };
+
     // copy the data from the GPU memory if needed
-    const bool is_host = ggml_backend_buffer_is_host(src1->buffer);
-
-    if (!is_host) {
-        const size_t src1_nbytes = ggml_nbytes(src1);
-        m_src1_data.resize(src1_nbytes);
-        ggml_backend_tensor_get(src1, m_src1_data.data(), 0, src1_nbytes);
-    }
-
-    const char * data = is_host ? (const char *) src1->data : m_src1_data.data();
+    const char * data = stage_src1(src1);
     GGML_ASSERT(src1->nb[0] == ggml_element_size(src1));
+    const auto t_copied = clk::now();
+    m_t_copy += std::chrono::duration<double>(t_copied - t_start).count();
+    {
+        const size_t p = wname.find('.', 4);
+        m_copy_by_kind[p == std::string::npos ? wname : wname.substr(p + 1)] += std::chrono::duration<double>(t_copied - t_start).count();
+    }
 
     // this has been adapted to the new format of storing merged experts in a single 3d tensor
     // ref: https://github.com/ggml-org/llama.cpp/pull/6387
@@ -616,8 +653,14 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
             GGML_ASSERT(false);
         }
 
-        m_ids.resize(ggml_nbytes(ids));
-        ggml_backend_tensor_get(ids, m_ids.data(), 0, ggml_nbytes(ids));
+        const bool same_ids = ids == m_last_ids && ids->data == m_last_ids_data;
+        if (!same_ids) {
+            m_ids.resize(ggml_nbytes(ids));
+            ggml_backend_tensor_get(ids, m_ids.data(), 0, ggml_nbytes(ids));
+            m_last_ids = ids;
+            m_last_ids_data = ids->data;
+            m_grouped_src1 = nullptr;
+        }
 
         auto & e = m_stats[wname];
 
@@ -644,25 +687,56 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         const int64_t n_tokens = src1->ne[2];
         const bool has_act = !e.activations.empty();
 
-        // single pass over the routing ids
+        // group the routed rows by expert, keeping the order of the serial idx-major loop, so that every expert's sums
+        // are added in the same order as before (bit-identical) while the experts are accumulated in parallel
         std::vector<uint8_t> touched(n_as, 0);
+        const bool regroup = m_grouped_src1 != src1;
+        if (regroup) {
+        m_ex_off.assign(n_as + 1, 0);
+        m_ex_rows.resize(n_ids * n_tokens);
         for (int64_t idx = 0; idx < n_ids; ++idx) {
             for (int64_t row = 0; row < n_tokens; ++row) {
                 const int32_t ex = *(const int32_t *) (m_ids.data() + row * ids->nb[1] + idx * ids->nb[0]);
                 GGML_ASSERT(ex >= 0 && ex < n_as);  // sanity check
-                const int64_t i11 = idx % src1->ne[1];
-                const float * x = (const float *) (data + i11 * src1->nb[1] + row * src1->nb[2]);
-                float * acc = e.values.data() + ex * ne0;
-                float * act = has_act ? e.activations.data() + ex * ne0 : nullptr; // legacy imatrix tensors do not have activation sums
-
-                e.counts[ex]++;
-                touched[ex] = 1;
+                m_ex_off[ex + 1]++;
+            }
+        }
+        for (int64_t ex = 0; ex < n_as; ++ex) {
+            m_ex_off[ex + 1] += m_ex_off[ex];
+        }
+        {
+            std::vector<int64_t> pos(m_ex_off.begin(), m_ex_off.end() - 1);
+            for (int64_t idx = 0; idx < n_ids; ++idx) {
+                for (int64_t row = 0; row < n_tokens; ++row) {
+                    const int32_t ex = *(const int32_t *) (m_ids.data() + row * ids->nb[1] + idx * ids->nb[0]);
+                    m_ex_rows[pos[ex]++] = (idx % src1->ne[1]) * src1->nb[1] + row * src1->nb[2];
+                }
+            }
+        }
+        m_grouped_src1 = src1;
+        }
+        for (int64_t ex = 0; ex < n_as; ++ex) {
+            const int64_t n = m_ex_off[ex + 1] - m_ex_off[ex];
+            e.counts[ex] += n;
+            touched[ex] = n > 0;
+        }
+        const int64_t * ex_off  = m_ex_off.data();
+        const int64_t * ex_rows = m_ex_rows.data();
+        float * values = e.values.data();
+        float * activations = has_act ? e.activations.data() : nullptr; // legacy imatrix tensors do not have activation sums
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int64_t ex = 0; ex < n_as; ++ex) {
+            float * acc = values + ex * ne0;
+            float * act = activations ? activations + ex * ne0 : nullptr;
+            for (int64_t r = ex_off[ex]; r < ex_off[ex + 1]; ++r) {
+                const float * x = (const float *) (data + ex_rows[r]);
                 for (int64_t j = 0; j < ne0; ++j) { acc[j] += x[j] * x[j]; }
                 if (act) {
                     for (int64_t j = 0; j < ne0; ++j) { act[j] += x[j]; }
                 }
             }
         }
+        m_t_acc += std::chrono::duration<double>(clk::now() - t_copied).count();
 
         // check for non-finite values, only checking experts that were routed to and touched
         for (int64_t ex = 0; ex < n_as; ++ex) {
@@ -718,21 +792,31 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
         const int64_t ne0 = src1->ne[0];
         const bool has_act = !e.activations.empty();
-        for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
-            for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
-                // handle 3D+ tensors, but flatten 3D+ activations when model tensor is 2D
-                const int64_t mat_id = (i3 % src0->ne[3]) * src0->ne[2] + (i2 % src0->ne[2]);
-                float * acc = e.values.data() + mat_id * ne0;
-                float * act = has_act ? e.activations.data() + mat_id * ne0 : nullptr;
-                for (int64_t row = 0; row < src1->ne[1]; ++row) {
-                    const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
-                    for (int64_t j = 0; j < ne0; ++j) { acc[j] += x[j] * x[j]; }
-                    if (act) {
-                        for (int64_t j = 0; j < ne0; ++j) { act[j] += x[j]; }
+        // columns are independent: split them across threads, rows stay in order within each column (bit-identical)
+        constexpr int64_t col_blk = 64;
+        const int64_t n_blk = (ne0 + col_blk - 1) / col_blk;
+        float * values = e.values.data();
+        float * activations = has_act ? e.activations.data() : nullptr;
+        #pragma omp parallel for schedule(static)
+        for (int64_t b = 0; b < n_blk; ++b) {
+            const int64_t j0 = b * col_blk, j1 = std::min(ne0, j0 + col_blk);
+            for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
+                for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
+                    // handle 3D+ tensors, but flatten 3D+ activations when model tensor is 2D
+                    const int64_t mat_id = (i3 % src0->ne[3]) * src0->ne[2] + (i2 % src0->ne[2]);
+                    float * acc = values + mat_id * ne0;
+                    float * act = activations ? activations + mat_id * ne0 : nullptr;
+                    for (int64_t row = 0; row < src1->ne[1]; ++row) {
+                        const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
+                        for (int64_t j = j0; j < j1; ++j) { acc[j] += x[j] * x[j]; }
+                        if (act) {
+                            for (int64_t j = j0; j < j1; ++j) { act[j] += x[j]; }
+                        }
                     }
                 }
             }
         }
+        m_t_acc += std::chrono::duration<double>(clk::now() - t_copied).count();
 
         // check for non-finite values
         if (!all_finite(e.values.data(), e.values.size())) {
@@ -757,6 +841,58 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
     }
 
     return true;
+}
+
+const char * IMatrixCollector::stage_src1(const ggml_tensor * src1) {
+    if (ggml_backend_buffer_is_host(src1->buffer)) {
+        if (src1 != m_last_src1 || src1->data != m_last_src1_data) {
+            m_last_src1 = src1;
+            m_last_src1_data = src1->data;
+            m_grouped_src1 = nullptr;
+        }
+        m_last_staged = nullptr;
+        return (const char *) src1->data;
+    }
+    const size_t nbytes = ggml_nbytes(src1);
+    if (src1 == m_last_src1 && src1->data == m_last_src1_data && m_last_staged) {
+        m_bytes_reused += nbytes;
+        return m_last_staged;
+    }
+    m_bytes += nbytes;
+    m_last_src1 = src1;
+    m_last_src1_data = src1->data;
+    m_last_staged = nullptr;
+    m_grouped_src1 = nullptr;
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src1->buffer));
+    ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (host_buft) {
+        ggml_backend_buffer_t & buf = m_pinned[dev];
+        if (!buf || ggml_backend_buffer_get_size(buf) < nbytes) {
+            if (buf) {
+                ggml_backend_buffer_free(buf);
+            }
+            buf = ggml_backend_buft_alloc_buffer(host_buft, nbytes + nbytes / 4);
+        }
+        if (buf) {
+            char * dst = (char *) ggml_backend_buffer_get_base(buf);
+            ggml_backend_tensor_get(src1, dst, 0, nbytes);
+            return m_last_staged = dst;
+        }
+    }
+    m_src1_data.resize(nbytes);
+    ggml_backend_tensor_get(src1, m_src1_data.data(), 0, nbytes);
+    return m_last_staged = m_src1_data.data();
+}
+
+void IMatrixCollector::print_timings() const {
+    LOG_INF("%s: collector callback %.2f s over %lld calls: copies %.2f s (%.2f GB, %.2f GB reused), accumulation %.2f s, other %.2f s\n",
+        __func__, m_t_total, (long long) m_n_calls, m_t_copy, m_bytes / 1e9, m_bytes_reused / 1e9, m_t_acc, m_t_total - m_t_copy - m_t_acc);
+    std::vector<std::pair<double, std::string>> v;
+    for (const auto & [k, x] : m_copy_by_kind) { v.push_back({x, k}); }
+    std::sort(v.rbegin(), v.rend());
+    for (size_t i = 0; i < v.size() && i < 8; ++i) {
+        LOG_INF("%s:   copy %-40s %7.2f s\n", __func__, v[i].second.c_str(), v[i].first);
+    }
 }
 
 void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
@@ -2037,6 +2173,7 @@ int main(int argc, char ** argv) {
     }
 
     if (!compute_imatrix(ctx, params, n_ctx, nextn.get())) { return 1; }
+    g_collector.print_timings();
 
     g_collector.save_imatrix();
 
