@@ -13,7 +13,7 @@ mkdir -p "$LOG"
 for cfg in "$@"; do
     IFS='|' read -r label envs sargs <<< "$cfg"
     read -ra kv <<< "$envs"; read -ra extra <<< "$sargs"
-    env "${kv[@]}" "$B/bin/llama-server" -m "$MODEL" --load-mode dio -dev ROCm0,ROCm1 -sm layer -ts 530,470 -ngl 99 \
+    env "${kv[@]}" "$B/bin/llama-server" -m "$MODEL" --load-mode dio -dev ROCm0,ROCm1 -sm layer -ts ${FN_TS:-530,470} -ngl 99 \
         -c 32768 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 256 -t 8 --cache-ram 0 --poll 0 \
         --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 --port $PORT "${extra[@]}" > "$LOG/server-$label.log" 2>&1 &
     pid=$!
