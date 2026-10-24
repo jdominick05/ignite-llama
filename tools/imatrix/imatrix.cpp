@@ -753,6 +753,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 m_last_chunk = n_chunk;
                 if ((m_last_chunk % m_params.n_out_freq) / chunk_step == 0) {
                     save_imatrix();
+                    LOG_INF("%s: saved after %d chunks, collector %.0f s so far\n", __func__, m_last_chunk, m_t_total);
                 }
                 if (m_params.n_save_freq > 0 && (m_last_chunk % m_params.n_save_freq) / chunk_step == 0) {
                     save_imatrix(m_last_chunk);
@@ -832,6 +833,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 m_last_chunk = n_chunk;
                 if ((m_last_chunk % m_params.n_out_freq) / chunk_step == 0) {
                     save_imatrix();
+                    LOG_INF("%s: saved after %d chunks, collector %.0f s so far\n", __func__, m_last_chunk, m_t_total);
                 }
                 if (m_params.n_save_freq > 0 && (m_last_chunk % m_params.n_save_freq) / chunk_step == 0) {
                     save_imatrix(m_last_chunk);
