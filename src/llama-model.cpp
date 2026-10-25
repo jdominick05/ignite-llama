@@ -332,6 +332,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen3next(params);
         case LLM_ARCH_QWEN35:
             return new llama_model_qwen35(params);
+        case LLM_ARCH_IGNITE_DRAFTER:
+            return new llama_model_ignite_drafter(params);
         case LLM_ARCH_QWEN35MOE:
             return new llama_model_qwen35moe(params);
         case LLM_ARCH_CLEF:
@@ -3531,6 +3533,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_NANBEIGE:
         case LLM_ARCH_POCKETTTS:
+        case LLM_ARCH_IGNITE_DRAFTER:   // RoPE on adjacent pairs (the PyTorch model's x[0::2] / x[1::2])
             return LLAMA_ROPE_TYPE_NORM;
         case LLM_ARCH_BAILINGMOE3:
             // VL files carry mrope sections; text-only files keep NORM rope

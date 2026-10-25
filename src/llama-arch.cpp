@@ -39,6 +39,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN3VL,          "qwen3vl"          },
     { LLM_ARCH_QWEN3VLMOE,       "qwen3vlmoe"       },
     { LLM_ARCH_QWEN35,           "qwen35"           },
+    { LLM_ARCH_IGNITE_DRAFTER,   "ignite-drafter"   },
     { LLM_ARCH_QWEN35MOE,        "qwen35moe"        },
     { LLM_ARCH_CLEF,             "clef"             },
     { LLM_ARCH_VLLM_DECISION2,   "vllm-decision2"   },
@@ -1228,6 +1229,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_GLM5_NEXT:
+        case LLM_ARCH_IGNITE_DRAFTER:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN4EXP:
@@ -1254,6 +1256,7 @@ bool llm_arch_is_diffusion(const llm_arch & arch) {
 bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_IGNITE_DRAFTER:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN4EXP:
